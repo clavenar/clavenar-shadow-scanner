@@ -31,7 +31,10 @@ SLACK_BOT_TOKEN=xoxb-… warden-shadow-scanner slack
 Output is **redacted by default** — secrets render as `<first4>…<last4>`.
 Pass `--unredacted` if you actually need the raw key in the report
 (e.g. for triage). The human-readable report leads with a banner
-warning the file is now a secrets file. JSON output via `--json`.
+warning the file is now a secrets file. JSON output via `--json`,
+SARIF v2.1.0 via `--sarif` (consumed by GitHub Code Scanning, Sonatype,
+Snyk, and most modern code-review tools — always redacted regardless
+of `--unredacted`).
 
 ## Subcommands
 
@@ -46,11 +49,30 @@ slack [--days N]                  Scan recent Slack history (default 14d).
 Common output flags (every subcommand):
 
 ```
---json                            Machine-readable output.
---unredacted                      Show secrets in plaintext (default: redact).
+--json                            Machine-readable JSON. Mutually exclusive with --sarif.
+--sarif                           SARIF v2.1.0 (always redacted; ready for GitHub
+                                  Code Scanning's `upload-sarif` action and friends).
+--unredacted                      Show secrets in plaintext in JSON / human output
+                                  (default: redact). Ignored under --sarif.
 --severity-min critical|high|medium|low
                                   Drop findings below this severity (default: low).
 ```
+
+### CI integration
+
+```yaml
+# .github/workflows/secrets-scan.yml
+- run: warden-shadow-scanner local . --sarif > results.sarif
+  continue-on-error: true       # exit 2 on findings — surface in the SARIF UI instead.
+- uses: github/codeql-action/upload-sarif@v3
+  with: { sarif_file: results.sarif }
+```
+
+SARIF severity maps to GitHub Code Scanning's three-level annotation
+system: `Critical`/`High` → `error` (red), `Medium` → `warning`
+(yellow), `Low` → `note` (blue). Each result carries a stable
+`fingerprints["warden/v1"]` (SHA-256 of the secret) so re-runs
+auto-resolve once the secret is removed.
 
 ## Auth
 
@@ -99,8 +121,6 @@ enough for clean CI integration.
 
 ## What it doesn't do (yet)
 
-- **Real Iceberg-grade output**: SARIF for CI integration is filed as
-  a follow-up.
 - **Slack threads + archived channels**: out of scope for the MVP.
   The high-value find is "did anyone paste a key into a non-archived
   channel I'm a member of."
