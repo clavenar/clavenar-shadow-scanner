@@ -1,2 +1,120 @@
 # warden-shadow-scanner
-Audit Tool. The free discovery tool that scans GitHub/Slack for unauthorized agent credentials.
+
+Free discovery tool that scans GitHub orgs, Slack workspaces, and local
+filesystems for unauthorized agent credentials — AI provider keys
+(Anthropic, OpenAI, Google AI, Voyage, Cohere, Mistral), cloud keys
+(AWS, GCP, Azure), and developer-platform tokens (GitHub PATs, Slack
+bot tokens, Stripe, NPM, JWTs, raw PEM private keys).
+
+The premise: organisations are deploying AI agents informally — random
+scripts using API keys, bots running on someone's laptop, "just for the
+demo" creds checked into a repo. The shadow scanner tells an
+organisation what's already in places it shouldn't be, before someone
+else finds it first.
+
+## Quick start
+
+```bash
+# Scan your laptop's home directory.
+warden-shadow-scanner local ~
+
+# Scan one repo on GitHub. (Set GITHUB_TOKEN — public API caps at 60 req/hr.)
+GITHUB_TOKEN=ghp_… warden-shadow-scanner github vanteguardlabs/warden-proxy
+
+# Scan every repo under an org.
+GITHUB_TOKEN=ghp_… warden-shadow-scanner github vanteguardlabs
+
+# Scan Slack history (last 14 days, every channel the bot is in).
+SLACK_BOT_TOKEN=xoxb-… warden-shadow-scanner slack
+```
+
+Output is **redacted by default** — secrets render as `<first4>…<last4>`.
+Pass `--unredacted` if you actually need the raw key in the report
+(e.g. for triage). The human-readable report leads with a banner
+warning the file is now a secrets file. JSON output via `--json`.
+
+## Subcommands
+
+```
+local <path>                      Scan a directory (gitignore-aware).
+github <owner>[/<repo>] [...]     Scan one repo or every repo under an owner.
+  --include-forks                 Also scan forked repos.
+  --include-archived              Also scan archived repos.
+slack [--days N]                  Scan recent Slack history (default 14d).
+```
+
+Common output flags (every subcommand):
+
+```
+--json                            Machine-readable output.
+--unredacted                      Show secrets in plaintext (default: redact).
+--severity-min critical|high|medium|low
+                                  Drop findings below this severity (default: low).
+```
+
+## Auth
+
+| Source | Env var          | Notes                                                                |
+|--------|------------------|----------------------------------------------------------------------|
+| local  | (none)           | Reads files directly; no creds needed.                               |
+| github | `GITHUB_TOKEN`   | PAT or App token. Optional but strongly recommended (rate limits).   |
+| slack  | `SLACK_BOT_TOKEN`| `xoxb-…`. Required scopes: `channels:read`, `channels:history` (and `groups:*` for private channels). |
+
+## Exit codes
+
+- `0` — no findings (or only `medium`/`low` findings).
+- `2` — at least one `high` or `critical` finding. CI-friendly.
+- `1` — runtime error (bad auth, network, etc.).
+
+## Output safety
+
+The scanner finds secrets, so the report itself can become a secrets
+file:
+
+- **Default**: secrets render as `<first4>…<last4>`. The JSON has no
+  `raw` field. The human report has no banner.
+- **`--unredacted`**: secrets render in full. JSON includes `raw`.
+  Human report leads with `!! UNREDACTED OUTPUT — this report contains
+  live secrets. Treat it as such.`
+- Findings dedupe by SHA-256 fingerprint of the raw secret, so the
+  same key in 12 files becomes one entry with 12 locations.
+
+## Detection rules
+
+Hand-written regex set with optional Shannon-entropy + length gates.
+~20 detectors covering:
+
+| Category            | Detectors                                                              |
+|---------------------|------------------------------------------------------------------------|
+| AI provider keys    | Anthropic (`sk-ant-…`), OpenAI (`sk-…`), Google AI (`AIza…`), Voyage (`pa-…`), Cohere, Mistral |
+| Cloud provider keys | AWS access key + secret, GCP service-account JSON, Azure client secret |
+| Dev-platform tokens | GitHub PAT/App, Slack bot/user/app tokens, Slack webhook URLs, Stripe live/test, NPM, JWT |
+| Cryptographic       | PEM private-key block opener                                           |
+| Generic backstop    | High-entropy string near `key`/`token`/`secret`/`password` keyword     |
+
+The generic backstop only fires when (a) entropy ≥ 4.0 bits/byte
+(rules out short identifiers), (b) length ≥ 24 chars, and (c) the line
+contains a sensitive keyword. Tuned to keep false-positive rate low
+enough for clean CI integration.
+
+## What it doesn't do (yet)
+
+- **Real Iceberg-grade output**: SARIF for CI integration is filed as
+  a follow-up.
+- **Slack threads + archived channels**: out of scope for the MVP.
+  The high-value find is "did anyone paste a key into a non-archived
+  channel I'm a member of."
+- **GitHub Enterprise**: only `api.github.com` is wired; Enterprise
+  endpoint support is a base-URL knob.
+- **Incremental scanning**: every invocation is a full scan. A delta
+  cache (skip blobs whose SHA we've already scanned) is a follow-up.
+- **Verifiers**: no live API call to confirm the secret is active.
+  Plumbing this in would need separate auth and is rate-limit-heavy.
+
+## License / shipping
+
+This is the free discovery tool — the top-of-funnel surface for the
+broader Agent Warden product. Open-source, distributed as a single
+binary, no telemetry. The point is to find the problem; the
+remediation pipeline (`warden-proxy`, `warden-policy-engine`,
+`warden-ledger`, `warden-hitl`) is what converts.
