@@ -70,6 +70,48 @@ fn unredacted_flag_includes_raw_key() {
 }
 
 #[test]
+fn sarif_flag_emits_v2_1_0_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = "sk-ant-api03-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC-deadbeef";
+    std::fs::write(dir.path().join(".env"), format!("KEY={}", key)).unwrap();
+
+    let output = Command::new(cargo_bin())
+        .arg("local")
+        .arg(dir.path())
+        .arg("--sarif")
+        .output()
+        .expect("run binary");
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["version"], "2.1.0");
+    assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "warden-shadow-scanner");
+    assert!(!stdout.contains(key), "raw key leaked into SARIF output");
+}
+
+#[test]
+fn sarif_and_json_are_mutually_exclusive() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "# clean\n").unwrap();
+
+    let output = Command::new(cargo_bin())
+        .arg("local")
+        .arg(dir.path())
+        .arg("--sarif")
+        .arg("--json")
+        .output()
+        .expect("run binary");
+    // clap exits 2 on argument-parse errors.
+    assert_ne!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--json") || stderr.contains("--sarif"),
+        "expected clap conflict error, got: {}",
+        stderr
+    );
+}
+
+#[test]
 fn severity_min_filters_below_threshold() {
     // Plant a Stripe TEST key (severity Low). Default scan would surface
     // it; --severity-min=high should drop it.

@@ -61,10 +61,16 @@ enum Command {
 #[derive(Args, Debug)]
 struct OutputArgs {
     /// Emit JSON (machine-readable) instead of the human-readable report.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "sarif")]
     json: bool,
+    /// Emit SARIF v2.1.0 (the format GitHub Code Scanning, Sonatype,
+    /// etc. consume). Always redacted — SARIF outputs end up as build
+    /// artefacts and we never teach this path to leak.
+    #[arg(long, conflicts_with = "json")]
+    sarif: bool,
     /// Show secrets in plaintext. **Default is redacted.** This makes
-    /// the output a secrets file — handle accordingly.
+    /// the output a secrets file — handle accordingly. Ignored when
+    /// `--sarif` is set (SARIF output is always redacted).
     #[arg(long)]
     unredacted: bool,
     /// Drop findings below this severity. One of: critical, high,
@@ -132,9 +138,14 @@ fn emit(source: &str, findings: Vec<warden_shadow_scanner::Finding>, out: Output
     let min = Severity::from_min(&out.severity_min)
         .with_context(|| format!("invalid --severity-min: {}", out.severity_min))?;
     let findings = filter_by_min_severity(findings, min);
-    let report = Report::from_findings(source, findings, out.unredacted);
+    // SARIF output is always redacted (these files routinely end up as
+    // CI artefacts / PR annotations). For json + human, the unredacted
+    // flag rides through unchanged.
+    let report = Report::from_findings(source, findings, out.unredacted && !out.sarif);
     let mut stdout = stdout().lock();
-    if out.json {
+    if out.sarif {
+        report.write_sarif(&mut stdout)?;
+    } else if out.json {
         report.write_json(&mut stdout)?;
     } else {
         report.write_human(&mut stdout, out.unredacted)?;

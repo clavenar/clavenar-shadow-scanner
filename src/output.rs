@@ -99,6 +99,116 @@ impl Report {
         writeln!(w, "{}", s)
     }
 
+    /// Write the report as SARIF v2.1.0 JSON
+    /// (<https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html>).
+    /// SARIF is the standard schema GitHub Advanced Security, Sonatype,
+    /// Snyk, and most modern code-review tools consume — emitting it
+    /// lets shadow-scanner findings flow into existing security
+    /// pipelines without an intermediate converter.
+    ///
+    /// Always redacted: the SARIF "message" never carries the raw
+    /// secret, regardless of whether the report itself was built with
+    /// `unredacted=true`. SARIF outputs typically end up as build
+    /// artifacts (PR annotations, CI logs); we deliberately never
+    /// teach this path to leak.
+    pub fn write_sarif(&self, mut w: impl Write) -> std::io::Result<()> {
+        // Each detector that actually fired becomes one `tool.driver.rules[]`
+        // entry. SARIF allows the rules array to be a subset of the tool's
+        // total rule catalogue, so we keep it tight.
+        //
+        // BTreeMap so the output ordering is deterministic across runs —
+        // important for diffs in CI artefacts (e.g. PR comparison runs).
+        let mut rules_by_detector: std::collections::BTreeMap<&str, &Aggregate> =
+            std::collections::BTreeMap::new();
+        for agg in &self.aggregates {
+            // First-seen wins — but since aggregates are already sorted by
+            // (severity, detector, fingerprint), the first one for a given
+            // detector is also the highest-severity instance, which is
+            // what we want for the rule's defaultConfiguration.level.
+            rules_by_detector.entry(&agg.detector).or_insert(agg);
+        }
+        let rules: Vec<serde_json::Value> = rules_by_detector
+            .values()
+            .map(|agg| {
+                serde_json::json!({
+                    "id": agg.detector,
+                    "name": agg.detector,
+                    "shortDescription": { "text": format!("{} credential detected", agg.detector) },
+                    "defaultConfiguration": { "level": severity_to_sarif_level(agg.severity) },
+                })
+            })
+            .collect();
+
+        // Each (aggregate, location) pair becomes one SARIF result. We
+        // don't collapse aggregates back into one result per fingerprint
+        // because SARIF tooling (GitHub Code Scanning especially) expects
+        // one annotation per file:line, and result.locations[] is more
+        // for related call-sites of the SAME finding, not "this same
+        // secret in a different file."
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        for agg in &self.aggregates {
+            for loc in &agg.locations {
+                let mut region = serde_json::json!({ "startLine": loc.line });
+                // SARIF region.snippet.text carries the surrounding
+                // context. We pre-redact this in `Finding`'s context
+                // construction (see detector.rs), so it's always safe to
+                // include verbatim.
+                if let Some(ctx) = &loc.context {
+                    region["snippet"] = serde_json::json!({ "text": ctx });
+                }
+                results.push(serde_json::json!({
+                    "ruleId": agg.detector,
+                    "level": severity_to_sarif_level(agg.severity),
+                    "message": {
+                        "text": format!(
+                            "{} credential detected (redacted: {}).",
+                            agg.detector, agg.redacted
+                        ),
+                    },
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": { "uri": loc.location },
+                            "region": region,
+                        }
+                    }],
+                    // SARIF dedupe key: re-runs of this scanner against
+                    // the same artefacts produce stable fingerprints, so
+                    // GitHub Code Scanning can auto-resolve a finding
+                    // when the secret is removed.
+                    "fingerprints": {
+                        "warden/v1": agg.fingerprint,
+                    },
+                }));
+            }
+        }
+
+        let doc = serde_json::json!({
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {
+                    "driver": {
+                        "name": "warden-shadow-scanner",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "informationUri": "https://github.com/vanteguardlabs/warden-shadow-scanner",
+                        "rules": rules,
+                    }
+                },
+                // Properties bag — non-standard but commonly used to
+                // carry tool-specific metadata. SARIF parsers ignore
+                // unknown keys here.
+                "properties": {
+                    "source": self.source,
+                    "scanned_at": self.scanned_at.to_rfc3339(),
+                    "total_findings": self.total_findings,
+                },
+                "results": results,
+            }],
+        });
+        let s = serde_json::to_string_pretty(&doc).expect("SARIF document always serializes");
+        writeln!(w, "{}", s)
+    }
+
     pub fn write_human(&self, mut w: impl Write, unredacted: bool) -> std::io::Result<()> {
         if unredacted {
             writeln!(
@@ -172,6 +282,19 @@ impl Report {
 /// means "ord <= chosen" in our enum direction.
 pub fn filter_by_min_severity(findings: Vec<Finding>, min: Severity) -> Vec<Finding> {
     findings.into_iter().filter(|f| f.severity <= min).collect()
+}
+
+/// Map our internal severity onto SARIF's three-level system.
+/// GitHub Code Scanning (the most common SARIF consumer) renders
+/// `error` red, `warning` yellow, `note` blue. Critical/High both map
+/// to `error` because both are immediately actionable; Medium is a
+/// warning, Low is a note.
+fn severity_to_sarif_level(s: Severity) -> &'static str {
+    match s {
+        Severity::Critical | Severity::High => "error",
+        Severity::Medium => "warning",
+        Severity::Low => "note",
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +373,112 @@ mod tests {
         let kept = filter_by_min_severity(inputs, Severity::High);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].detector, "anthropic_api_key");
+    }
+
+    #[test]
+    fn sarif_output_has_v2_1_0_envelope() {
+        let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
+        let r = Report::from_findings(
+            "test",
+            vec![finding("anthropic_api_key", Severity::Critical, key, "a/.env", 7)],
+            false,
+        );
+        let mut buf = Vec::new();
+        r.write_sarif(&mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+        assert_eq!(v["version"], "2.1.0");
+        assert!(
+            v["$schema"].as_str().unwrap().contains("sarif-2.1.0"),
+            "schema URL must point at v2.1.0"
+        );
+        assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "warden-shadow-scanner");
+    }
+
+    #[test]
+    fn sarif_output_never_includes_raw_secret() {
+        // Even when the report was built with `unredacted=true`,
+        // write_sarif must redact — SARIF artefacts end up in CI logs.
+        let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
+        let r = Report::from_findings(
+            "test",
+            vec![finding("anthropic_api_key", Severity::Critical, key, "a/.env", 7)],
+            true, // unredacted
+        );
+        let mut buf = Vec::new();
+        r.write_sarif(&mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(!s.contains(key), "raw secret leaked into SARIF output");
+    }
+
+    #[test]
+    fn sarif_severity_maps_to_three_level_system() {
+        assert_eq!(severity_to_sarif_level(Severity::Critical), "error");
+        assert_eq!(severity_to_sarif_level(Severity::High), "error");
+        assert_eq!(severity_to_sarif_level(Severity::Medium), "warning");
+        assert_eq!(severity_to_sarif_level(Severity::Low), "note");
+    }
+
+    #[test]
+    fn sarif_results_carry_fingerprint_and_location() {
+        let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
+        let r = Report::from_findings(
+            "test",
+            vec![
+                finding("anthropic_api_key", Severity::Critical, key, "a/.env", 7),
+                finding("anthropic_api_key", Severity::Critical, key, "b/.env", 12),
+            ],
+            false,
+        );
+        let mut buf = Vec::new();
+        r.write_sarif(&mut buf).unwrap();
+        let v: serde_json::Value = serde_json::from_str(std::str::from_utf8(&buf).unwrap()).unwrap();
+        let results = v["runs"][0]["results"].as_array().unwrap();
+        // Two locations -> two SARIF results, each pinning its file:line.
+        assert_eq!(results.len(), 2);
+        let lines: Vec<u64> = results
+            .iter()
+            .map(|r| r["locations"][0]["physicalLocation"]["region"]["startLine"].as_u64().unwrap())
+            .collect();
+        assert!(lines.contains(&7) && lines.contains(&12));
+        // Fingerprint is the same on both (same secret).
+        let fp1 = results[0]["fingerprints"]["warden/v1"].as_str().unwrap();
+        let fp2 = results[1]["fingerprints"]["warden/v1"].as_str().unwrap();
+        assert_eq!(fp1, fp2);
+        // ruleId matches the detector.
+        assert_eq!(results[0]["ruleId"], "anthropic_api_key");
+    }
+
+    #[test]
+    fn sarif_rules_dedupe_per_detector() {
+        let r = Report::from_findings(
+            "test",
+            vec![
+                finding("anthropic", Severity::Critical, "sk-ant-api03-AAA", "a", 1),
+                finding("anthropic", Severity::Critical, "sk-ant-api03-BBB", "b", 1),
+                finding("github_pat", Severity::Critical, "ghp_AAA", "c", 1),
+            ],
+            false,
+        );
+        let mut buf = Vec::new();
+        r.write_sarif(&mut buf).unwrap();
+        let v: serde_json::Value = serde_json::from_str(std::str::from_utf8(&buf).unwrap()).unwrap();
+        let rules = v["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
+        // Two unique detectors -> two rules, regardless of how many
+        // findings each fired.
+        assert_eq!(rules.len(), 2);
+        let ids: Vec<&str> = rules.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"anthropic") && ids.contains(&"github_pat"));
+    }
+
+    #[test]
+    fn sarif_empty_report_still_valid() {
+        let r = Report::from_findings("test", vec![], false);
+        let mut buf = Vec::new();
+        r.write_sarif(&mut buf).unwrap();
+        let v: serde_json::Value = serde_json::from_str(std::str::from_utf8(&buf).unwrap()).unwrap();
+        assert_eq!(v["runs"][0]["results"].as_array().unwrap().len(), 0);
+        assert_eq!(v["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap().len(), 0);
     }
 
     #[test]
