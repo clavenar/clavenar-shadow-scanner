@@ -1,0 +1,31 @@
+[package]
+name = "warden-shadow-scanner"
+version = "0.1.0"
+edition = "2024"
+description = "Free discovery tool that scans GitHub/Slack/local-fs for unauthorized agent credentials."
+
+[[bin]]
+name = "warden-shadow-scanner"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time"] }
+# rustls-tls so we don't drag OpenSSL onto end-user laptops — this is the
+# free top-of-funnel tool, friction matters.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+hex = "0.4"
+# `ignore` from ripgrep — gitignore-aware fs walk so a `node_modules` or
+# `.venv` doesn't drown the scan in third-party noise.
+ignore = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
