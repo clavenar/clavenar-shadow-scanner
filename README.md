@@ -137,4 +137,4 @@ This is the free discovery tool — the top-of-funnel surface for the
 broader Agent Warden product. Open-source, distributed as a single
 binary, no telemetry. The point is to find the problem; the
 remediation pipeline (`warden-proxy`, `warden-policy-engine`,
-`warden-ledger`, `warden-hitl`) is what converts.
+`warden-ledger`, `warden-hil`) is what converts.
