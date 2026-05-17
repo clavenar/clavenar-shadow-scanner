@@ -135,6 +135,9 @@ fn r(s: &str) -> Regex {
     Regex::new(s).expect("static detector regex should compile")
 }
 
+// Declarative table — each `Detector` is a short, uniform struct literal.
+// `too_many_lines` punishes the density a catalog wants; suppression is
+// the documented use-case for declarative builders.
 #[allow(clippy::too_many_lines)]
 fn build_detectors() -> Vec<Detector> {
     vec![
@@ -190,6 +193,33 @@ fn build_detectors() -> Vec<Detector> {
             min_entropy: None,
             min_length: None,
         },
+        Detector {
+            name: "xai_api_key",
+            description: "xAI / Grok API key (xai-...).",
+            severity: Severity::Critical,
+            pattern: r(r"\b(xai-[A-Za-z0-9]{80})\b"),
+            min_entropy: None,
+            min_length: None,
+        },
+        Detector {
+            name: "groq_api_key",
+            description: "Groq API key (gsk_...).",
+            severity: Severity::Critical,
+            pattern: r(r"\b(gsk_[A-Za-z0-9]{52})\b"),
+            min_entropy: None,
+            min_length: None,
+        },
+        Detector {
+            name: "huggingface_token",
+            description: "Hugging Face user / OAuth access token (hf_...).",
+            severity: Severity::Critical,
+            // HF user-access tokens are `hf_` + 34-40 alphanum. OAuth-issued
+            // tokens use the same prefix but typically run longer; the {30,}
+            // floor covers both without admitting short identifiers.
+            pattern: r(r"\b(hf_[A-Za-z0-9]{30,})\b"),
+            min_entropy: None,
+            min_length: None,
+        },
         // --- Cloud provider keys -----------------------------------------------
         Detector {
             name: "aws_access_key_id",
@@ -222,6 +252,36 @@ fn build_detectors() -> Vec<Detector> {
             pattern: r(r#"(?i)azure[_\-]?client[_\-]?secret[^"'\n]{0,20}["']?([A-Za-z0-9~._\-]{34,})"#),
             min_entropy: Some(4.0),
             min_length: Some(34),
+        },
+        Detector {
+            name: "cloudflare_api_token",
+            description: "Cloudflare API token (40-char base64ish, anchored near 'cloudflare').",
+            severity: Severity::High,
+            // Modern user API tokens have no fixed prefix; anchor on the
+            // 'cloudflare' / 'cf_api_token' keyword to keep precision up.
+            pattern: r(r#"(?i)(?:cloudflare|cf[_-]?api[_-]?token)[^"'\n]{0,20}["']?([A-Za-z0-9_\-]{40})\b"#),
+            min_entropy: Some(4.0),
+            min_length: Some(40),
+        },
+        Detector {
+            name: "digitalocean_pat",
+            description: "DigitalOcean personal access token (dop_v1_...).",
+            severity: Severity::Critical,
+            pattern: r(r"\b(dop_v1_[a-f0-9]{64})\b"),
+            min_entropy: None,
+            min_length: None,
+        },
+        Detector {
+            name: "fly_io_token",
+            description: "Fly.io macaroon token (FlyV1 fm[12]_...).",
+            severity: Severity::High,
+            // Fly emits macaroons prefixed with `FlyV1 fm2_` (current) or
+            // `fm1_` (legacy); the body is a base64 payload. Anchoring on
+            // the `FlyV1 fm` shape eliminates collisions with bare `fm_`
+            // strings that appear in unrelated codebases.
+            pattern: r(r"\b(FlyV1 fm[12]_[A-Za-z0-9+/=_\-]{40,})"),
+            min_entropy: None,
+            min_length: None,
         },
         // --- Developer-platform tokens -----------------------------------------
         Detector {
@@ -287,6 +347,110 @@ fn build_detectors() -> Vec<Detector> {
             description: "NPM access token.",
             severity: Severity::High,
             pattern: r(r"\b(npm_[A-Za-z0-9]{36})\b"),
+            min_entropy: None,
+            min_length: None,
+        },
+        Detector {
+            name: "gitlab_pat",
+            description: "GitLab personal access token (glpat-...).",
+            severity: Severity::High,
+            pattern: r(r"\b(glpat-[A-Za-z0-9_\-]{20,})\b"),
+            min_entropy: None,
+            min_length: None,
+        },
+        Detector {
+            name: "atlassian_api_token",
+            description: "Atlassian API token (ATATT3xFfGF0...) used by Jira / Confluence / Bitbucket Cloud.",
+            severity: Severity::High,
+            pattern: r(r"\b(ATATT3[A-Za-z0-9_\-]{50,})\b"),
+            min_entropy: None,
+            min_length: None,
+        },
+        Detector {
+            name: "sourcegraph_pat",
+            description: "Sourcegraph personal access token (sgp_...).",
+            severity: Severity::Medium,
+            pattern: r(r"\b(sgp_[A-Za-z0-9]{40,})\b"),
+            min_entropy: None,
+            min_length: None,
+        },
+        // --- CI / deploy platforms ---------------------------------------------
+        Detector {
+            name: "vercel_token",
+            description: "Vercel access token (24-char alphanum, anchored near 'vercel').",
+            severity: Severity::High,
+            pattern: r(r#"(?i)vercel[^"'\n]{0,40}["']?([A-Za-z0-9]{24})\b"#),
+            min_entropy: Some(4.0),
+            min_length: Some(24),
+        },
+        Detector {
+            name: "netlify_pat",
+            description: "Netlify personal access token (nfp_...).",
+            severity: Severity::High,
+            pattern: r(r"\b(nfp_[A-Za-z0-9]{40,})\b"),
+            min_entropy: None,
+            min_length: None,
+        },
+        Detector {
+            name: "railway_token",
+            description: "Railway project / team token (UUID near 'railway').",
+            severity: Severity::High,
+            pattern: r(r#"(?i)railway[^"'\n]{0,40}["']?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b"#),
+            min_entropy: None,
+            min_length: None,
+        },
+        // --- Database / data plane ---------------------------------------------
+        Detector {
+            name: "planetscale_password",
+            description: "PlanetScale database password (pscale_pw_...).",
+            severity: Severity::Critical,
+            pattern: r(r"\b(pscale_pw_[A-Za-z0-9_\-]{40,})\b"),
+            min_entropy: None,
+            min_length: None,
+        },
+        Detector {
+            name: "supabase_service_role_jwt",
+            description: "Supabase service-role JWT (admin-scope database key).",
+            severity: Severity::Critical,
+            // The JWT body decodes to `role:"service_role"` — we can't see
+            // that without decoding, so anchor on a `supabase` identifier on
+            // the same line + a JWT-shaped value to keep precision high.
+            pattern: r(r#"(?i)supabase[^"'\n]{0,40}["']?(eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})"#),
+            min_entropy: None,
+            min_length: None,
+        },
+        Detector {
+            name: "neon_postgres_url",
+            description: "Neon Postgres connection URL with embedded password (...@*.neon.tech).",
+            severity: Severity::Critical,
+            pattern: r(r"(postgres(?:ql)?://[^\s:@]+:[^\s@]+@[^\s/]+\.neon\.tech[^\s]*)"),
+            min_entropy: None,
+            min_length: None,
+        },
+        // --- Communications / messaging ----------------------------------------
+        Detector {
+            name: "telegram_bot_token",
+            description: "Telegram bot token (<bot_id>:<35-char body>).",
+            severity: Severity::Medium,
+            pattern: r(r"\b(\d{8,10}:[A-Za-z0-9_\-]{35})\b"),
+            min_entropy: None,
+            min_length: None,
+        },
+        Detector {
+            name: "discord_bot_token",
+            description: "Discord bot token (3-segment base64-dotted).",
+            severity: Severity::Medium,
+            // Bot tokens start with M/N (snowflake encoded), then `.`,
+            // 6-7 char timestamp segment, `.`, 27-38 char HMAC tail.
+            pattern: r(r"\b([MN][A-Za-z\d]{23,28}\.[\w\-]{6,7}\.[\w\-]{27,38})\b"),
+            min_entropy: None,
+            min_length: None,
+        },
+        Detector {
+            name: "sendgrid_api_key",
+            description: "SendGrid API key (SG.<22>.<43>).",
+            severity: Severity::High,
+            pattern: r(r"\b(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43})\b"),
             min_entropy: None,
             min_length: None,
         },
@@ -525,6 +689,137 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         let f1 = scan_text(&t, "loc-1");
         let f2 = scan_text(&t, "loc-2");
         assert_eq!(f1[0].fingerprint(), f2[0].fingerprint());
+    }
+
+    #[test]
+    fn detects_xai_api_key() {
+        // xAI keys are exactly `xai-` + 80 alphanum.
+        let body: String = "aB3kQ9zL2pXn7rVfG8sJ".repeat(4); // 80 chars
+        let text = format!("XAI_API_KEY=xai-{body}");
+        let f = scan_text(&text, "test");
+        assert!(f.iter().any(|x| x.detector == "xai_api_key"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_groq_api_key() {
+        let text = "GROQ_API_KEY=gsk_aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234567890ABCDEFGHIJ";
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "groq_api_key"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_huggingface_token() {
+        let text = "HF_TOKEN=hf_aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234";
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "huggingface_token"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_cloudflare_api_token() {
+        let text = r#"cloudflare_api_token = "aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi12345678""#;
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "cloudflare_api_token"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_digitalocean_pat() {
+        let text = "DO_TOKEN=dop_v1_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "digitalocean_pat"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_fly_io_token() {
+        let text = "FLY_API_TOKEN=FlyV1 fm2_lJPECAAAAAAAAAAAAA+aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi";
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "fly_io_token"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_gitlab_pat() {
+        let text = "GITLAB_TOKEN=glpat-aB3kQ9zL2pXn7rVfG8sJ";
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "gitlab_pat"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_atlassian_api_token() {
+        let text = "JIRA_TOKEN=ATATT3xFfGF0aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234567890AB";
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "atlassian_api_token"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_sourcegraph_pat() {
+        let text = "SRC_ACCESS_TOKEN=sgp_aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234ABCDEFG";
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "sourcegraph_pat"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_vercel_token() {
+        let text = r#"vercel_token = "aB3kQ9zL2pXn7rVfG8sJ4mTu""#;
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "vercel_token"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_netlify_pat() {
+        // Netlify PATs are nfp_ + 40+ alphanum.
+        let text = "NETLIFY_AUTH_TOKEN=nfp_aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi12345ABCDEFGH";
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "netlify_pat"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_railway_token() {
+        let text = r#"RAILWAY_TOKEN="abcd1234-ef56-7890-ab12-cdef34567890""#;
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "railway_token"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_planetscale_password() {
+        let text = "DATABASE_URL=pscale_pw_aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234ABCDEFG";
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "planetscale_password"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_supabase_service_role_jwt() {
+        let text = r#"SUPABASE_SERVICE_ROLE_KEY="eyJhbGciOiJIUzI1NiIs.eyJzdWIxMjM0NTY3.aB3kQ9zL2pXn7rVfG8sJ""#;
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "supabase_service_role_jwt"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_neon_postgres_url() {
+        let text = "DATABASE_URL=postgresql://user:supersecretpassword@ep-blue-dawn-12345.us-east-2.aws.neon.tech/mydb?sslmode=require";
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "neon_postgres_url"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_telegram_bot_token() {
+        // Telegram bot tokens: <bot_id>:<exactly 35 chars>.
+        let text = r#"TELEGRAM_BOT_TOKEN="123456789:AAH-aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcH""#;
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "telegram_bot_token"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_discord_bot_token() {
+        let text = "DISCORD_BOT_TOKEN=MTIzNDU2Nzg5MDEyMzQ1Njc4OTA.aB3kQ9.aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi";
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "discord_bot_token"), "missed: {:?}", f);
+    }
+
+    #[test]
+    fn detects_sendgrid_api_key() {
+        // SendGrid: SG.<exactly 22>.<exactly 43>.
+        let text = r#"SENDGRID_API_KEY="SG.aB3kQ9zL2pXn7rVfG8sJ4m.aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234567890A""#;
+        let f = scan_text(text, "test");
+        assert!(f.iter().any(|x| x.detector == "sendgrid_api_key"), "missed: {:?}", f);
     }
 
     #[test]

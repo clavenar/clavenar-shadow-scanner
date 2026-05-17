@@ -2,9 +2,13 @@
 
 Free discovery tool that scans GitHub orgs, Slack workspaces, and local
 filesystems for unauthorized agent credentials — AI provider keys
-(Anthropic, OpenAI, Google AI, Voyage, Cohere, Mistral), cloud keys
-(AWS, GCP, Azure), and developer-platform tokens (GitHub PATs, Slack
-bot tokens, Stripe, NPM, JWTs, raw PEM private keys).
+(Anthropic, OpenAI, Google AI, xAI, Groq, Hugging Face, Voyage, Cohere,
+Mistral), cloud / edge (AWS, GCP, Azure, Cloudflare, DigitalOcean,
+Fly.io), CI / deploy platforms (Vercel, Netlify, Railway), dev
+platforms (GitHub, GitLab, Atlassian, Sourcegraph, Slack bot tokens,
+Slack webhooks, Stripe, NPM), database / data plane (PlanetScale,
+Supabase service-role, Neon Postgres URLs), and messaging (Telegram,
+Discord, SendGrid) — plus raw PEM private keys and JWTs.
 
 The premise: organisations are deploying AI agents informally — random
 scripts using API keys, bots running on someone's laptop, "just for the
@@ -104,13 +108,16 @@ file:
 ## Detection rules
 
 Hand-written regex set with optional Shannon-entropy + length gates.
-~19 detectors covering:
+~37 detectors covering:
 
 | Category            | Detectors                                                              |
 |---------------------|------------------------------------------------------------------------|
-| AI provider keys    | Anthropic (`sk-ant-…`), OpenAI (`sk-…`), Google AI (`AIza…`), Voyage (`pa-…`), Cohere, Mistral |
-| Cloud provider keys | AWS access key + secret, GCP service-account JSON, Azure client secret |
-| Dev-platform tokens | GitHub token (PAT / OAuth / App / refresh — `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`), Slack bot/user/app tokens, Slack webhook URLs, Stripe live/test, NPM, JWT |
+| AI provider keys    | Anthropic (`sk-ant-…`), OpenAI (`sk-…`), Google AI (`AIza…`), xAI / Grok (`xai-…`), Groq (`gsk_…`), Hugging Face (`hf_…`), Voyage (`pa-…`), Cohere, Mistral |
+| Cloud / edge        | AWS access key + secret, GCP service-account JSON, Azure client secret, Cloudflare API token, DigitalOcean (`dop_v1_…`), Fly.io (`FlyV1 fm…`) |
+| CI / deploy         | Vercel, Netlify (`nfp_…`), Railway                                     |
+| Dev-platform tokens | GitHub token (PAT / OAuth / App / refresh — `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`), GitLab (`glpat-…`), Atlassian (`ATATT3…`), Sourcegraph (`sgp_…`), Slack bot/user/app tokens, Slack webhook URLs, Stripe live/test, NPM, JWT |
+| Database / data     | PlanetScale (`pscale_pw_…`), Supabase service-role JWT, Neon Postgres URL (`*.neon.tech` with embedded password) |
+| Messaging           | Telegram bot tokens, Discord bot tokens, SendGrid (`SG.<22>.<43>`)     |
 | Cryptographic       | PEM private-key block opener                                           |
 | Generic backstop    | High-entropy string near `key`/`token`/`secret`/`password` keyword     |
 
