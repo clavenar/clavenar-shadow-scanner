@@ -1,5 +1,8 @@
 # warden-shadow-scanner
 
+[![CI](https://github.com/vanteguardlabs/warden-shadow-scanner/actions/workflows/ci.yml/badge.svg)](https://github.com/vanteguardlabs/warden-shadow-scanner/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
+
 Free discovery tool that scans GitHub orgs, Slack workspaces, and local
 filesystems for unauthorized agent credentials — AI provider keys
 (Anthropic, OpenAI, Google AI, xAI, Groq, Hugging Face, Voyage, Cohere,
@@ -141,7 +144,17 @@ enough for clean CI integration.
 ## License / shipping
 
 This is the free discovery tool — the top-of-funnel surface for the
-broader Agent Warden product. Open-source, distributed as a single
-binary, no telemetry. The point is to find the problem; the
-remediation pipeline (`warden-proxy`, `warden-policy-engine`,
-`warden-ledger`, `warden-hil`) is what converts.
+broader Agent Warden product. Open-source under
+[Apache-2.0](./LICENSE), distributed as a single binary, no telemetry.
+The point is to find the problem; the remediation pipeline
+(`warden-proxy`, `warden-policy-engine`, `warden-ledger`,
+`warden-hil`) is what converts.
+
+## Next step: stop the credentials from leaking
+
+Once the scanner shows you what's already exposed, route your AI
+agents through [warden-lite](https://github.com/vanteguardlabs/warden-lite)
+to prevent exfiltration: a single-binary MCP proxy with
+human-in-the-loop approval and an append-only audit chain. Same
+distribution model (one static binary), same Apache-2.0 license,
+no telemetry.
