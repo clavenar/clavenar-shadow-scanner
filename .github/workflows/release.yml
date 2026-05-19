@@ -1,0 +1,98 @@
+name: release
+
+# Push a tag matching v* (e.g. v0.2.0) to publish. The tag must
+# match Cargo.toml's `version`; the workflow asserts this before
+# anything destructive runs.
+#
+# What this ships:
+#   1. Static linux-x86_64 musl binary as a release asset.
+#   2. Static linux-aarch64 musl binary as a release asset.
+#   3. A GitHub release with auto-generated commit notes as the body.
+#
+# Shadow-scanner is binary-only (no container image, no published
+# crate) — partners install via `curl | tar | install` or download
+# the binary directly from the GitHub release page. Mirror of
+# warden-lite/.github/workflows/release.yml minus the container
+# image steps.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # required for `gh release create`
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify tag matches Cargo.toml version
+        id: ver
+        run: |
+          TAG=${GITHUB_REF_NAME#v}
+          CARGO_VERSION=$(grep -E '^version = ' Cargo.toml | head -1 | sed -E 's/version = "(.*)"/\1/')
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME (=$TAG) does not match Cargo.toml ($CARGO_VERSION)"
+            exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-release
+
+      - name: Install musl + cross-aarch64 toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+
+      - name: Build static linux-x86_64 binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          BIN=target/x86_64-unknown-linux-musl/release/warden-shadow-scanner
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -qE '=>'; then
+            echo "::error::x86_64 binary is not statically linked"
+            ldd "$BIN" || true
+            exit 1
+          fi
+          VERSION="${{ steps.ver.outputs.version }}"
+          ASSET="warden-shadow-scanner-${VERSION}-x86_64-linux-musl.tar.gz"
+          tar -czf "$ASSET" -C "$(dirname "$BIN")" "$(basename "$BIN")"
+          sha256sum "$ASSET" | tee "${ASSET}.sha256"
+          echo "asset_x86=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Build static linux-aarch64 binary
+        env:
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --locked --target aarch64-unknown-linux-musl
+          BIN=target/aarch64-unknown-linux-musl/release/warden-shadow-scanner
+          file "$BIN"
+          VERSION="${{ steps.ver.outputs.version }}"
+          ASSET="warden-shadow-scanner-${VERSION}-aarch64-linux-musl.tar.gz"
+          tar -czf "$ASSET" -C "$(dirname "$BIN")" "$(basename "$BIN")"
+          sha256sum "$ASSET" | tee "${ASSET}.sha256"
+          echo "asset_arm=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "${GITHUB_REF_NAME} — warden-shadow-scanner" \
+            --generate-notes \
+            "$asset_x86" \
+            "${asset_x86}.sha256" \
+            "$asset_arm" \
+            "${asset_arm}.sha256"
