@@ -19,6 +19,13 @@ demo" creds checked into a repo. The shadow scanner tells an
 organisation what's already in places it shouldn't be, before someone
 else finds it first.
 
+Sequence diagrams for the five primary paths — CLI dispatch + the
+shared `emit` pipeline, the gitignore-aware local scan, the GitHub
+owner/repo scan with rate-limit backoff, the Slack workspace
+cursor-paginated scan, and the per-line detector engine + Report
+aggregation — plus a request decision-tree flowchart, live in
+[`docs/SEQUENCES.md`](docs/SEQUENCES.md).
+
 ## Quick start
 
 ```bash
