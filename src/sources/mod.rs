@@ -11,7 +11,7 @@ pub mod slack;
 /// regex time.
 pub(crate) const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
-pub(crate) const USER_AGENT_VALUE: &str = "warden-shadow-scanner/0.1";
+pub(crate) const USER_AGENT_VALUE: &str = "clavenar-shadow-scanner/0.1";
 
 /// `git`-style binary detection: any NUL byte in the first 8 KiB means
 /// "treat as binary." UTF-8 can't contain NUL, so a positive hit rules

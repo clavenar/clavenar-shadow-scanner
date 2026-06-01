@@ -130,7 +130,7 @@ impl Report {
         }
         writeln!(
             w,
-            "warden-shadow-scanner :: source={}  scanned_at={}",
+            "clavenar-shadow-scanner :: source={}  scanned_at={}",
             self.source,
             self.scanned_at.to_rfc3339()
         )?;

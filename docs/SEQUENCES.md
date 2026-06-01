@@ -1,4 +1,4 @@
-# warden-shadow-scanner sequence diagrams
+# clavenar-shadow-scanner sequence diagrams
 
 Five sequence diagrams covering the wire-level paths the scanner can
 take: CLI dispatch + the shared `emit` pipeline, the gitignore-aware
@@ -35,7 +35,7 @@ sequenceDiagram
     participant Rep as Report::from_findings
     participant Out as write_human / write_json / write_sarif
 
-    Op->>Main: warden-shadow-scanner subcommand [...]
+    Op->>Main: clavenar-shadow-scanner subcommand [...]
     Main->>Main: tracing_subscriber::registry + EnvFilter (default warn, stderr writer)
     Main->>Cli: parse argv + env
     Cli-->>Main: Cli { command, OutputArgs { json, sarif, unredacted, severity_min } }
@@ -367,7 +367,7 @@ surviving aggregate is Critical or High.
 
 ```mermaid
 flowchart TD
-    Start([warden-shadow-scanner subcommand ...]) --> Tracing[tracing_subscriber init<br/>RUST_LOG default warn<br/>stderr writer]
+    Start([clavenar-shadow-scanner subcommand ...]) --> Tracing[tracing_subscriber init<br/>RUST_LOG default warn<br/>stderr writer]
     Tracing --> Parse[clap Cli parse + OutputArgs flatten]
     Parse --> Sub{subcommand}
 
@@ -386,7 +386,7 @@ flowchart TD
     Filter --> Build[Report::from_findings<br/>BTreeMap fingerprint dedupe<br/>location, line collapse<br/>higher-severity detector wins]
 
     Build --> Fmt{output format}
-    Fmt -->|--sarif| Sarif[write_sarif<br/>always redacted, ignores --unredacted<br/>fingerprint as warden/v1 stable id]
+    Fmt -->|--sarif| Sarif[write_sarif<br/>always redacted, ignores --unredacted<br/>fingerprint as clavenar/v1 stable id]
     Fmt -->|--json| Json[write_json<br/>raw field present only if unredacted]
     Fmt -->|default| Human[write_human<br/>banner if unredacted<br/>cap locations at 5, suggest --json]
 

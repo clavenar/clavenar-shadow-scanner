@@ -68,7 +68,7 @@ pub(super) fn write(report: &Report, mut w: impl Write) -> std::io::Result<()> {
                 // Stable per-secret dedupe key — re-runs auto-resolve a
                 // finding once the secret is removed.
                 "fingerprints": {
-                    "warden/v1": agg.fingerprint,
+                    "clavenar/v1": agg.fingerprint,
                 },
             }));
         }
@@ -80,9 +80,9 @@ pub(super) fn write(report: &Report, mut w: impl Write) -> std::io::Result<()> {
         "runs": [{
             "tool": {
                 "driver": {
-                    "name": "warden-shadow-scanner",
+                    "name": "clavenar-shadow-scanner",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "informationUri": "https://github.com/vanteguardlabs/warden-shadow-scanner",
+                    "informationUri": "https://github.com/clavenar/clavenar-shadow-scanner",
                     "rules": rules,
                 }
             },
@@ -145,7 +145,7 @@ mod tests {
             v["$schema"].as_str().unwrap().contains("sarif-2.1.0"),
             "schema URL must point at v2.1.0"
         );
-        assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "warden-shadow-scanner");
+        assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "clavenar-shadow-scanner");
     }
 
     #[test]
@@ -193,8 +193,8 @@ mod tests {
             .map(|r| r["locations"][0]["physicalLocation"]["region"]["startLine"].as_u64().unwrap())
             .collect();
         assert!(lines.contains(&7) && lines.contains(&12));
-        let fp1 = results[0]["fingerprints"]["warden/v1"].as_str().unwrap();
-        let fp2 = results[1]["fingerprints"]["warden/v1"].as_str().unwrap();
+        let fp1 = results[0]["fingerprints"]["clavenar/v1"].as_str().unwrap();
+        let fp2 = results[1]["fingerprints"]["clavenar/v1"].as_str().unwrap();
         assert_eq!(fp1, fp2);
         assert_eq!(results[0]["ruleId"], "anthropic_api_key");
     }
