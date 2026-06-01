@@ -1,4 +1,4 @@
-//! warden-shadow-scanner — CLI entry point.
+//! clavenar-shadow-scanner — CLI entry point.
 //!
 //! Three scan subcommands: `local`, `github`, `slack`. Common output
 //! flags are split out into [`OutputArgs`] so each subcommand sees the
@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use std::io::stdout;
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use warden_shadow_scanner::{
+use clavenar_shadow_scanner::{
     detector::Severity,
     output::{filter_by_min_severity, Report},
     sources,
@@ -17,7 +17,7 @@ use warden_shadow_scanner::{
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "warden-shadow-scanner",
+    name = "clavenar-shadow-scanner",
     version,
     about = "Find unauthorized agent credentials in repos, chat, and on-disk."
 )]
@@ -134,7 +134,7 @@ async fn run_slack(days: i64, out: OutputArgs) -> Result<()> {
     emit(&format!("slack://workspace?days={}", days), findings, out)
 }
 
-fn emit(source: &str, findings: Vec<warden_shadow_scanner::Finding>, out: OutputArgs) -> Result<()> {
+fn emit(source: &str, findings: Vec<clavenar_shadow_scanner::Finding>, out: OutputArgs) -> Result<()> {
     let min = Severity::from_min(&out.severity_min)
         .with_context(|| format!("invalid --severity-min: {}", out.severity_min))?;
     let findings = filter_by_min_severity(findings, min);

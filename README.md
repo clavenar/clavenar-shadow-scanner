@@ -1,6 +1,6 @@
-# warden-shadow-scanner
+# clavenar-shadow-scanner
 
-[![CI](https://github.com/vanteguardlabs/warden-shadow-scanner/actions/workflows/ci.yml/badge.svg)](https://github.com/vanteguardlabs/warden-shadow-scanner/actions/workflows/ci.yml)
+[![CI](https://github.com/clavenar/clavenar-shadow-scanner/actions/workflows/ci.yml/badge.svg)](https://github.com/clavenar/clavenar-shadow-scanner/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 
 Free discovery tool that scans GitHub orgs, Slack workspaces, and local
@@ -30,16 +30,16 @@ aggregation — plus a request decision-tree flowchart, live in
 
 ```bash
 # Scan your laptop's home directory.
-warden-shadow-scanner local ~
+clavenar-shadow-scanner local ~
 
 # Scan one repo on GitHub. (Set GITHUB_TOKEN — public API caps at 60 req/hr.)
-GITHUB_TOKEN=ghp_… warden-shadow-scanner github vanteguardlabs/warden-proxy
+GITHUB_TOKEN=ghp_… clavenar-shadow-scanner github clavenar/clavenar-proxy
 
 # Scan every repo under an org.
-GITHUB_TOKEN=ghp_… warden-shadow-scanner github vanteguardlabs
+GITHUB_TOKEN=ghp_… clavenar-shadow-scanner github vanteguardlabs
 
 # Scan Slack history (last 14 days, every channel the bot is in).
-SLACK_BOT_TOKEN=xoxb-… warden-shadow-scanner slack
+SLACK_BOT_TOKEN=xoxb-… clavenar-shadow-scanner slack
 ```
 
 Output is **redacted by default** — secrets render as `<first4>…<last4>`.
@@ -76,7 +76,7 @@ Common output flags (every subcommand):
 
 ```yaml
 # .github/workflows/secrets-scan.yml
-- run: warden-shadow-scanner local . --sarif > results.sarif
+- run: clavenar-shadow-scanner local . --sarif > results.sarif
   continue-on-error: true       # exit 2 on findings — surface in the SARIF UI instead.
 - uses: github/codeql-action/upload-sarif@v3
   with: { sarif_file: results.sarif }
@@ -85,7 +85,7 @@ Common output flags (every subcommand):
 SARIF severity maps to GitHub Code Scanning's three-level annotation
 system: `Critical`/`High` → `error` (red), `Medium` → `warning`
 (yellow), `Low` → `note` (blue). Each result carries a stable
-`fingerprints["warden/v1"]` (SHA-256 of the secret) so re-runs
+`fingerprints["clavenar/v1"]` (SHA-256 of the secret) so re-runs
 auto-resolve once the secret is removed.
 
 ## Auth
@@ -151,16 +151,16 @@ enough for clean CI integration.
 ## License / shipping
 
 This is the free discovery tool — the top-of-funnel surface for the
-broader Agent Warden product. Open-source under
+broader Clavenar product. Open-source under
 [Apache-2.0](./LICENSE), distributed as a single binary, no telemetry.
 The point is to find the problem; the remediation pipeline
-(`warden-proxy`, `warden-policy-engine`, `warden-ledger`,
-`warden-hil`) is what converts.
+(`clavenar-proxy`, `clavenar-policy-engine`, `clavenar-ledger`,
+`clavenar-hil`) is what converts.
 
 ## Next step: stop the credentials from leaking
 
 Once the scanner shows you what's already exposed, route your AI
-agents through [warden-lite](https://github.com/vanteguardlabs/warden-lite)
+agents through [clavenar-lite](https://github.com/clavenar/clavenar-lite)
 to prevent exfiltration: a single-binary MCP proxy with
 human-in-the-loop approval and an append-only audit chain. Same
 distribution model (one static binary), same Apache-2.0 license,

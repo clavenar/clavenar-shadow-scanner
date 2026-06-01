@@ -1,4 +1,4 @@
-//! Agent Warden — shadow scanner.
+//! Clavenar — shadow scanner.
 //!
 //! A free top-of-funnel discovery tool that scans GitHub orgs, Slack
 //! channels, and local filesystems for unauthorized agent credentials
