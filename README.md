@@ -26,6 +26,31 @@ cursor-paginated scan, and the per-line detector engine + Report
 aggregation — plus a request decision-tree flowchart, live in
 [`docs/SEQUENCES.md`](docs/SEQUENCES.md).
 
+## Install
+
+No account, no sign-up — grab the static binary and run.
+
+**Static binary** (Linux x86_64 / aarch64, fully static musl — no
+runtime deps, no installer):
+
+```bash
+V=0.1.0
+curl -fsSL "https://github.com/clavenar/clavenar-shadow-scanner/releases/download/v${V}/clavenar-shadow-scanner-${V}-x86_64-linux-musl.tar.gz" \
+  | tar -xz
+./clavenar-shadow-scanner local ~
+```
+
+Swap `x86_64` for `aarch64` on ARM. A `.sha256` companion is published
+beside each tarball if you want to verify before extracting; the
+binaries come from the [release workflow](.github/workflows/release.yml)
+on every `v*` tag.
+
+**From source** (any platform with a Rust toolchain):
+
+```bash
+cargo install --git https://github.com/clavenar/clavenar-shadow-scanner
+```
+
 ## Quick start
 
 ```bash
