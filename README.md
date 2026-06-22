@@ -119,7 +119,7 @@ auto-resolve once the secret is removed.
 |--------|------------------|----------------------------------------------------------------------|
 | local  | (none)           | Reads files directly; no creds needed.                               |
 | github | `GITHUB_TOKEN`   | PAT or App token. Optional but strongly recommended (rate limits).   |
-| slack  | `SLACK_BOT_TOKEN`| `xoxb-…`. Required scopes: `channels:read`, `channels:history` (and `groups:*` for private channels). |
+| slack  | `SLACK_BOT_TOKEN`| `xoxb-…`. Required scopes: `channels:read`, `channels:history` (and `groups:read`, `groups:history`, `mpim:history`, `im:history` for private channels and DMs). |
 
 ## Exit codes
 
