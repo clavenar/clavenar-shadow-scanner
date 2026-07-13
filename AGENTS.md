@@ -41,6 +41,7 @@ Exit codes: `0` no findings (or only medium/low) · `2` ≥1 high/critical (CI-f
 - **Binary-only release:** no container image, no published crate (`publish = false`). Distribution is `curl | tar | run` of the musl binary, or `cargo install --git`. Release tag `v*` must equal `Cargo.toml` `version` (workflow asserts).
 - `edition = "2024"`. `[lints.rust] unreachable_pub = "warn"` — keep non-API items non-`pub`.
 - Rust house rules: clippy `-D warnings` is the floor — fix the code, don't `#[allow]` (note the reason if a documented false positive). Anything in a `pub` fn signature must itself be `pub` (`private_interfaces`). Tests go at file bottom in `#[cfg(test)] mod tests` (`items_after_test_module`). Prefer `writeln!` over `write!(…, "\n")` and let-chains over nested `if let`. Doc comments: prose only — no `+ ` line-start continuations (`doc_lazy_continuation`).
+- Commit subjects must start with a lowercase letter.
 - `deny.toml` is synced verbatim from `clavenar-specs` — edit it there first, then mirror the exact bytes.
 
 ## Pointers
