@@ -32,6 +32,9 @@ Exit codes: `0` no findings (or only medium/low) · `2` ≥1 high/critical (CI-f
 - `tests/` — integration tests. `docs/SEQUENCES.md` — sequence diagrams for the five primary paths + the request decision-tree. `docs/DETECTORS.md` — detector catalog (37 rules, gates, SARIF contract); keep in sync with `build_detectors`.
 
 ## Conventions & invariants
+
+- After adding or updating a feature, also update the relevant `MANUAL_TESTS*` file(s) when needed.
+
 - **Redacted by default.** Secrets render `<first4>…<last4>`; JSON has no `raw` field. `--unredacted` shows plaintext, adds `raw`, and the human report leads with a `!! UNREDACTED OUTPUT` banner. SARIF is **always redacted** regardless of `--unredacted`.
 - **Findings dedupe by SHA-256 fingerprint** of the raw secret — the same key in 12 files collapses to one finding with 12 locations. SARIF emits this as a stable `fingerprints["clavenar/v1"]` so re-runs auto-resolve once the secret is removed.
 - **SARIF severity → GitHub Code Scanning:** Critical/High → `error`, Medium → `warning`, Low → `note`.
