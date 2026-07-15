@@ -258,6 +258,42 @@ pub async fn scan_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::{CoverageEvaluation, CoverageStatus};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    struct MockResponse {
+        path_prefix: &'static str,
+        body: &'static str,
+    }
+
+    fn mock_slack(responses: Vec<MockResponse>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 8192];
+                let length = stream.read(&mut request).unwrap();
+                let request = std::str::from_utf8(&request[..length]).unwrap();
+                let request_path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap();
+                assert!(request_path.starts_with(response.path_prefix));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.body.len(),
+                    response.body
+                )
+                .unwrap();
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
 
     #[test]
     fn urlencoding_preserves_unreserved() {
@@ -285,5 +321,44 @@ mod tests {
             SourceErrorKind::ConversationList
         );
         assert!(outcome.coverage().partial());
+        let evaluation = CoverageEvaluation::evaluate(outcome.coverage(), 100.0);
+        assert_eq!(evaluation.status, CoverageStatus::TotalFailure);
+        assert!(evaluation.requires_failure());
+    }
+
+    #[tokio::test]
+    async fn mixed_channel_failure_exceeds_default_partial_threshold() {
+        let (base_url, server) = mock_slack(vec![
+            MockResponse {
+                path_prefix: "/users.conversations?",
+                body: r#"{"ok":true,"channels":[{"id":"C1","name":"one","is_archived":false,"is_member":true},{"id":"C2","name":"two","is_archived":false,"is_member":true}],"response_metadata":{"next_cursor":""}}"#,
+            },
+            MockResponse {
+                path_prefix: "/conversations.history?channel=C1&",
+                body: r#"{"ok":true,"messages":[{"text":"clean","ts":"1","user":"U1"}],"response_metadata":{"next_cursor":""}}"#,
+            },
+            MockResponse {
+                path_prefix: "/conversations.history?channel=C2&",
+                body: r#"{"ok":false,"error":"synthetic_failure","messages":[]}"#,
+            },
+        ]);
+        let client = SlackClient {
+            http: reqwest::Client::new(),
+            token: "synthetic-test-token".into(),
+            base_url,
+        };
+        let outcome = scan_workspace(&client, 1).await.unwrap();
+        server.join().unwrap();
+
+        assert_eq!(outcome.coverage().objects_scanned(), 1);
+        assert_eq!(outcome.coverage().bytes_scanned(), 5);
+        assert_eq!(outcome.coverage().source_errors().len(), 1);
+        assert_eq!(
+            outcome.coverage().source_errors()[0].kind,
+            SourceErrorKind::ChannelHistory
+        );
+        let evaluation = CoverageEvaluation::evaluate(outcome.coverage(), 10.0);
+        assert_eq!(evaluation.status, CoverageStatus::ThresholdExceeded);
+        assert!(evaluation.requires_failure());
     }
 }

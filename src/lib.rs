@@ -25,4 +25,7 @@ pub use detector::{
     shannon_entropy,
 };
 pub use sources::local::LocalScanMode;
-pub use sources::{ScanCoverage, ScanOutcome, SourceError, SourceErrorKind};
+pub use sources::{
+    COVERAGE_FAILURE_EXIT_CODE, CoverageEvaluation, CoverageStatus, DEFAULT_MAX_PARTIAL_PERCENT,
+    ScanCoverage, ScanOutcome, SourceError, SourceErrorKind,
+};

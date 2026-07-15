@@ -17,8 +17,9 @@ boundaries it crosses: the local filesystem (via the `ignore` crate),
 
 `main` reads as a sequential pipeline: tracing init (default `warn`)
 → clap `Cli::parse` → dispatch to one of three async runners → each
-calls the safe `emit` path to filter, group, and format → exit 0/2 by
-`any_high` aggregation. Explicit local `--unredacted` dispatches through
+calls the safe `emit` path to filter, group, format, and choose exit 0/2/3 from
+coverage policy and `any_high` aggregation (coverage failure exits 3 before a
+finding can exit 2). Explicit local `--unredacted` dispatches through
 `scan_directory_unredacted` and `emit_unredacted`; GitHub and Slack reject that
 flag before source access, and clap rejects its use with SARIF.
 
@@ -38,13 +39,13 @@ sequenceDiagram
     Op->>Main: clavenar-shadow-scanner subcommand [...]
     Main->>Main: tracing_subscriber::registry + EnvFilter (default warn, stderr writer)
     Main->>Cli: parse argv + env
-    Cli-->>Main: Cli { command, local secrets_mode, OutputArgs { json, sarif, unredacted, severity_min } }
+    Cli-->>Main: Cli { command, local secrets_mode, OutputArgs { json, sarif, unredacted, severity_min, max_partial_percent } }
     break Command::Local with --unredacted
         Main->>Run: run_local(path, out)
         Run->>Src: sources::local::scan_directory_unredacted(path)
         Src-->>Run: ScanOutcomeUnsafeFinding (raw retained deliberately + typed coverage)
         Run->>Emit: emit_unredacted(source, outcome, out)
-        Emit->>Rep: UnsafeReport::from_outcome
+        Emit->>Rep: UnsafeReport::from_outcome_with_threshold
         Note over Emit,Rep: human banner; JSON unsafe_output=true + warning; no SARIF writer
         Rep-->>Emit: UnsafeReport carrying mandatory warning
         Emit->>Out: write unsafe human or JSON
@@ -69,9 +70,9 @@ sequenceDiagram
     Sev->>Emit: Severity enum
     Emit->>Sev: outcome.map_findings(filter_by_min_severity)
     Sev-->>Emit: filtered ScanOutcomeFinding
-    Emit->>Rep: Report::from_outcome(source, filtered outcome)
+    Emit->>Rep: Report::from_outcome_with_threshold(source, filtered outcome, max_partial_percent)
     Note over Emit,Rep: safe Finding, Aggregate, and Report models contain no recoverable raw value
-    Rep-->>Emit: Report { source, scanned_at, coverage, aggregates, total_findings }
+    Rep-->>Emit: Report { source, scanned_at, coverage, coverage_evaluation, aggregates, total_findings }
     alt out.sarif
         Emit->>Out: report.write_sarif(stdout)
     else out.json
@@ -80,10 +81,14 @@ sequenceDiagram
         Emit->>Out: report.write_human(stdout)
     end
     Out-->>Op: stdout payload
-    Emit->>Emit: any_high = aggregates.iter().any(Critical or High)
-    alt any_high
+    alt coverage status is threshold_exceeded, truncated, or total_failure
+        Emit-->>Op: process::exit(3) — coverage failure takes precedence
+    else accepted coverage
+        Emit->>Emit: any_high = aggregates.iter().any(Critical or High)
+    end
+    alt accepted coverage and any_high
         Emit-->>Op: process::exit(2)  — CI-friendly
-    else no critical or high (or filtered out)
+    else accepted coverage and no critical or high (or filtered out)
         Emit-->>Op: exit 0
     end
     Note over Main,Op: item/source failures stay in coverage; setup or fatal errors before an outcome exit 1
@@ -382,7 +387,8 @@ sequenceDiagram
     end
     Scan-->>Caller: VecFinding — no recoverable raw field
 
-    Caller->>Rep: Report::from_outcome(source, ScanOutcome { findings, coverage })
+    Caller->>Rep: Report::from_outcome_with_threshold(source, ScanOutcome { findings, coverage }, max_partial_percent)
+    Rep->>Rep: evaluate coverage<br/>incomplete = skipped + source errors<br/>attempted = scanned + incomplete<br/>strict threshold; truncation and total failure always fail
     loop every finding
         Rep->>Rep: BTreeMap entry-or-insert Aggregate { fingerprint, detector, severity, redacted, locations: [] }
         alt f.severity < entry.severity
@@ -395,21 +401,25 @@ sequenceDiagram
         end
     end
     Rep->>Rep: collect into Vec — sort by (severity ASC, detector, fingerprint) for stable diff
-    Rep-->>Caller: Report { source, scanned_at: Utc::now, coverage, aggregates, total_findings }
+    Rep-->>Caller: Report { source, scanned_at: Utc::now, coverage, coverage_evaluation, aggregates, total_findings }
 ```
 
 ## 6. Request decision tree (flowchart)
 
 A single CLI invocation fans out across four orthogonal knobs: the
 source subcommand, the output format, the redaction posture, and
-the severity-min cutoff. The exit code then comes from whether any
-surviving aggregate is Critical or High.
+the severity-min cutoff. Coverage is evaluated first; a total source failure,
+truncation, or incomplete percentage strictly above the configured threshold
+exits `3`. Only accepted coverage proceeds to finding exit `2` or clean exit
+`0`.
 
 ```mermaid
 flowchart TD
     Start([clavenar-shadow-scanner subcommand ...]) --> Tracing[tracing_subscriber init<br/>RUST_LOG default warn<br/>stderr writer]
     Tracing --> Parse[clap Cli parse + OutputArgs flatten]
-    Parse --> Sub{subcommand}
+    Parse --> Threshold{--max-partial-percent<br/>finite and 0..100?}
+    Threshold -->|no| ArgErr[clap argument error]
+    Threshold -->|yes| Sub{subcommand}
 
     Sub -->|local path| L[standard gitignore-aware scan<br/>optional --secrets-mode ignored credential supplement<br/>canonical root, no symlinks or unsafe internals<br/>per-file size + binary + utf8 gates]
     Sub -->|github owner or owner/repo| G[reject --unredacted before access<br/>GITHUB_TOKEN optional, 60 rph fallback<br/>orgs then users endpoint fallback<br/>rate-limit + 429 retry loop]
@@ -423,20 +433,24 @@ flowchart TD
     Emit --> SevMin{Severity::from_min<br/>valid?}
     SevMin -->|no| Err1[exit 1 — anyhow context]
     SevMin -->|yes| Filter[filter_by_min_severity]
-    Filter --> Build[safe Report::from_outcome<br/>preserve typed coverage<br/>no recoverable raw field<br/>BTreeMap fingerprint dedupe<br/>location, line collapse]
+    Filter --> Build[safe Report::from_outcome_with_threshold<br/>preserve typed coverage<br/>evaluate complete, partial within threshold,<br/>threshold exceeded, truncated, total failure<br/>no recoverable raw field<br/>BTreeMap fingerprint dedupe<br/>location, line collapse]
 
     Build --> Fmt{output format}
     Fmt -->|--sarif| Sarif[write_sarif<br/>safe model only<br/>fingerprint as clavenar/v1 stable id]
     Fmt -->|--json| Json[write_json<br/>safe model has no raw field]
     Fmt -->|default| Human[write_human<br/>redacted display only<br/>cap locations at 5, suggest --json]
 
-    Sarif --> AnyHigh{any aggregate<br/>Critical or High?}
-    Json --> AnyHigh
-    Human --> AnyHigh
+    Sarif --> CoverageFail{coverage requires<br/>failure?}
+    Json --> CoverageFail
+    Human --> CoverageFail
+    CoverageFail -->|yes| E3[process::exit 3 — coverage failure]
+    CoverageFail -->|no| AnyHigh{any aggregate<br/>Critical or High?}
     AnyHigh -->|yes| E2[process::exit 2 — CI-friendly]
     AnyHigh -->|no| E0[exit 0]
 
     Err1 --> End([process exits])
+    ArgErr --> End
     E0 --> End
     E2 --> End
+    E3 --> End
 ```

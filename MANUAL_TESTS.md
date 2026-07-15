@@ -56,6 +56,25 @@ release candidate.
 5. Repeat the complete synthetic-credential corpus and confirm adding coverage
    metadata does not place any raw value in default human, JSON, or SARIF.
 
+## Coverage decision and exit policy
+
+1. Scan an empty directory and confirm exit `0`, status `complete`, zero
+   attempted objects, and recommended exit `0` in JSON and SARIF.
+2. Scan nine clean UTF-8 files plus one synthetic binary. At the default 10%
+   maximum, confirm exit `0`, status `partial_within_threshold`, and an exact
+   incomplete percentage of 10. Repeat with `--max-partial-percent 9.9` and
+   confirm exit `3` with status `threshold_exceeded`.
+3. Scan a nonexistent local root and confirm exit `3` and status
+   `total_failure`, including when the maximum is 100. Run the deterministic
+   GitHub truncation test and confirm status `truncated` and exit recommendation
+   `3` regardless of threshold.
+4. Put a synthetic high-severity credential in a readable file beside a
+   skipped binary. Confirm the finding remains redacted and coverage exit `3`
+   takes precedence over finding exit `2`.
+5. Repeat the total and mixed-failure matrices for local, GitHub, and Slack.
+   Confirm human, JSON, SARIF, and explicit unsafe-local output report the same
+   source-neutral status, counts, percentage, configured maximum, and decision.
+
 ## GitHub truncation and safe ignored-file mode
 
 1. Run the deterministic GitHub mock tests. Confirm a recursive-tree response

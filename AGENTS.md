@@ -19,16 +19,16 @@ Host-build caveat: `CARGO_TARGET_DIR=/tmp/clavenar-shadow-scanner-target` (a rep
 Run: CLI binary `clavenar-shadow-scanner` — no listener, no daemon; it scans and exits. Subcommands:
 `local <path> [--secrets-mode]` · `github <owner>[/<repo>]` (scans the default branch of non-fork, non-archived repos;
 `--include-forks` / `--include-archived` widen) · `slack [--days N]`. Common flags on every subcommand:
-`--json` | `--sarif` (mutually exclusive) · `--unredacted` · `--severity-min critical|high|medium|low`.
+`--json` | `--sarif` (mutually exclusive) · `--unredacted` · `--severity-min critical|high|medium|low` · `--max-partial-percent 0..100` (default 10).
 Auth via env: `GITHUB_TOKEN` (optional; public API caps at 60 req/hr), `SLACK_BOT_TOKEN` (`xoxb-…`). `local` needs no creds.
-Exit codes: `0` no high/critical findings (coverage may still be partial) · `2` ≥1 high/critical (CI-friendly) · `1` setup/fatal runtime error before a typed outcome. Inspect `coverage.partial` until threshold enforcement lands.
+Exit codes: `0` accepted coverage and no high/critical findings · `3` total source failure, truncation, or incomplete percentage strictly above the configured threshold · `2` ≥1 high/critical (CI-friendly) · `1` setup/fatal runtime error before a typed outcome. Coverage exit `3` takes precedence over finding exit `2`.
 
 ## Layout
 - `src/main.rs` — CLI entry. clap `Cli`/`Command` enum (`Local`/`Github`/`Slack`); `OutputArgs` flattened into each subcommand so all share one output surface.
 - `src/lib.rs` — public API: re-exports detector APIs plus `ScanOutcome`, `ScanCoverage`, `SourceError`, and `SourceErrorKind`. Library consumers (tests, future SDK) call these directly; `main.rs` is a thin wrapper.
 - `src/detector.rs` — ~37 hand-written regex detectors + optional Shannon-entropy/length gates; the per-line scan engine and `Severity`.
-- `src/sources/` — per-platform fetchers, each returning the common typed outcome with findings, scanned objects/bytes, skips, structured errors, truncation, and invariant partial state: `local.rs` (gitignore-aware walk plus root-confined `Secrets` supplement via the `ignore` crate), `github.rs` (owner/repo scan, recursive-tree truncation, rate-limit backoff), `slack.rs` (cursor-paginated workspace history; `DEFAULT_LOOKBACK_DAYS`).
-- `src/output/` — `mod.rs` (`Report`, coverage, redaction, `filter_by_min_severity`), `sarif.rs` (SARIF v2.1.0 emitter with coverage properties).
+- `src/sources/` — per-platform fetchers, each returning the common typed outcome with findings, scanned objects/bytes, skips, structured errors, truncation, invariant partial state, and source-neutral coverage evaluation: `local.rs` (gitignore-aware walk plus root-confined `Secrets` supplement via the `ignore` crate), `github.rs` (owner/repo scan, recursive-tree truncation, rate-limit backoff), `slack.rs` (cursor-paginated workspace history; `DEFAULT_LOOKBACK_DAYS`).
+- `src/output/` — `mod.rs` (`Report`, coverage evaluation, redaction, `filter_by_min_severity`), `sarif.rs` (SARIF v2.1.0 emitter with coverage and decision properties).
 - `tests/` — integration tests. `docs/SEQUENCES.md` — sequence diagrams for the five primary paths + the request decision-tree. `docs/DETECTORS.md` — detector catalog (37 rules, gates, SARIF contract); keep in sync with `build_detectors`.
 
 ## Conventions & invariants

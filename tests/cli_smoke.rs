@@ -70,6 +70,24 @@ fn local_scan_clean_dir_exits_zero() {
 }
 
 #[test]
+fn genuinely_empty_source_is_complete_and_exits_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(cargo_bin())
+        .arg("local")
+        .arg(dir.path())
+        .arg("--json")
+        .output()
+        .expect("run empty-directory scan");
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["coverage"]["objects_scanned"], 0);
+    assert_eq!(report["coverage"]["partial"], false);
+    assert_eq!(report["coverage_evaluation"]["status"], "complete");
+    assert_eq!(report["coverage_evaluation"]["attempted_objects"], 0);
+    assert_eq!(report["coverage_evaluation"]["recommended_exit_code"], 0);
+}
+
+#[test]
 fn unredacted_flag_includes_raw_key() {
     let dir = tempfile::tempdir().unwrap();
     let key = "sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB-deadbeef";
@@ -259,4 +277,97 @@ fn secrets_mode_adds_gitignored_credential_files() {
             >= 2
     );
     assert!(!String::from_utf8_lossy(&secrets.stdout).contains(key));
+}
+
+#[test]
+fn total_source_failure_exits_three_with_explicit_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    let output = Command::new(cargo_bin())
+        .arg("local")
+        .arg(missing)
+        .arg("--json")
+        .output()
+        .expect("run missing-root scan");
+    assert_eq!(output.status.code(), Some(3));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["coverage"]["objects_scanned"], 0);
+    assert_eq!(report["coverage"]["partial"], true);
+    assert_eq!(report["coverage_evaluation"]["status"], "total_failure");
+    assert_eq!(report["coverage_evaluation"]["recommended_exit_code"], 3);
+}
+
+#[test]
+fn partial_threshold_is_strict_and_configurable() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..9 {
+        std::fs::write(dir.path().join(format!("clean-{index}.txt")), "clean\n").unwrap();
+    }
+    std::fs::write(dir.path().join("binary.bin"), b"\0binary").unwrap();
+
+    let accepted = Command::new(cargo_bin())
+        .arg("local")
+        .arg(dir.path())
+        .arg("--json")
+        .output()
+        .expect("run threshold-boundary scan");
+    assert_eq!(accepted.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&accepted.stdout).unwrap();
+    assert_eq!(
+        report["coverage_evaluation"]["status"],
+        "partial_within_threshold"
+    );
+    assert_eq!(report["coverage_evaluation"]["incomplete_percent"], 10.0);
+
+    let rejected = Command::new(cargo_bin())
+        .arg("local")
+        .arg(dir.path())
+        .arg("--json")
+        .arg("--max-partial-percent")
+        .arg("9.9")
+        .output()
+        .expect("run over-threshold scan");
+    assert_eq!(rejected.status.code(), Some(3));
+    let report: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(
+        report["coverage_evaluation"]["status"],
+        "threshold_exceeded"
+    );
+}
+
+#[test]
+fn coverage_failure_takes_precedence_over_finding_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = "sk-ant-api03-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII-iZbYcXdW";
+    std::fs::write(dir.path().join("credential.env"), format!("KEY={key}\n")).unwrap();
+    std::fs::write(dir.path().join("binary.bin"), b"\0binary").unwrap();
+    let output = Command::new(cargo_bin())
+        .arg("local")
+        .arg(dir.path())
+        .arg("--json")
+        .output()
+        .expect("run finding plus coverage failure");
+    assert_eq!(output.status.code(), Some(3));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["total_findings"].as_u64().unwrap() > 0);
+    assert_eq!(
+        report["coverage_evaluation"]["status"],
+        "threshold_exceeded"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(key));
+}
+
+#[test]
+fn partial_threshold_rejects_out_of_range_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(cargo_bin())
+        .arg("local")
+        .arg(dir.path())
+        .arg("--max-partial-percent")
+        .arg("100.1")
+        .output()
+        .expect("run invalid threshold");
+    assert_ne!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("finite number from 0 through 100"));
 }

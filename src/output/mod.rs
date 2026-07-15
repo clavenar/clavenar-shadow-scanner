@@ -10,7 +10,7 @@
 mod sarif;
 
 use crate::detector::{Finding, Severity, UnsafeFinding};
-use crate::sources::{ScanCoverage, ScanOutcome};
+use crate::sources::{CoverageEvaluation, DEFAULT_MAX_PARTIAL_PERCENT, ScanCoverage, ScanOutcome};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -38,6 +38,8 @@ pub struct Report {
     pub scanned_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub coverage: ScanCoverage,
+    #[serde(default)]
+    pub coverage_evaluation: CoverageEvaluation,
     pub aggregates: Vec<Aggregate>,
     pub total_findings: usize,
 }
@@ -50,12 +52,26 @@ impl Report {
 
     /// Group a typed scan outcome while preserving its source coverage.
     pub fn from_outcome(source: impl Into<String>, outcome: ScanOutcome<Finding>) -> Self {
-        let (findings, coverage) = outcome.into_parts();
-        Self::build(source, findings, coverage)
+        Self::from_outcome_with_threshold(source, outcome, DEFAULT_MAX_PARTIAL_PERCENT)
     }
 
-    fn build(source: impl Into<String>, findings: Vec<Finding>, coverage: ScanCoverage) -> Self {
+    pub fn from_outcome_with_threshold(
+        source: impl Into<String>,
+        outcome: ScanOutcome<Finding>,
+        max_partial_percent: f64,
+    ) -> Self {
+        let (findings, coverage) = outcome.into_parts();
+        Self::build(source, findings, coverage, max_partial_percent)
+    }
+
+    fn build(
+        source: impl Into<String>,
+        findings: Vec<Finding>,
+        coverage: ScanCoverage,
+        max_partial_percent: f64,
+    ) -> Self {
         let total_findings = findings.len();
+        let coverage_evaluation = CoverageEvaluation::evaluate(&coverage, max_partial_percent);
         // BTreeMap so output ordering is stable across runs (helpful for
         // diffs in CI).
         let mut buckets: BTreeMap<String, Aggregate> = BTreeMap::new();
@@ -104,6 +120,7 @@ impl Report {
             source: source.into(),
             scanned_at: chrono::Utc::now(),
             coverage,
+            coverage_evaluation,
             aggregates,
             total_findings,
         }
@@ -132,7 +149,7 @@ impl Report {
             self.aggregates.len(),
             self.total_findings
         )?;
-        write_human_coverage(&self.coverage, &mut w)?;
+        write_human_coverage(&self.coverage, &self.coverage_evaluation, &mut w)?;
         writeln!(w)?;
 
         if self.aggregates.is_empty() {
@@ -201,6 +218,7 @@ pub struct UnsafeReport {
     pub source: String,
     pub scanned_at: chrono::DateTime<chrono::Utc>,
     pub coverage: ScanCoverage,
+    pub coverage_evaluation: CoverageEvaluation,
     pub aggregates: Vec<UnsafeAggregate>,
     pub total_findings: usize,
 }
@@ -211,6 +229,14 @@ impl UnsafeReport {
     }
 
     pub fn from_outcome(source: impl Into<String>, outcome: ScanOutcome<UnsafeFinding>) -> Self {
+        Self::from_outcome_with_threshold(source, outcome, DEFAULT_MAX_PARTIAL_PERCENT)
+    }
+
+    pub fn from_outcome_with_threshold(
+        source: impl Into<String>,
+        outcome: ScanOutcome<UnsafeFinding>,
+        max_partial_percent: f64,
+    ) -> Self {
         let (findings, coverage) = outcome.into_parts();
         let mut raw_by_fingerprint = BTreeMap::new();
         let safe_findings = findings
@@ -223,7 +249,7 @@ impl UnsafeReport {
                 safe
             })
             .collect();
-        let report = Report::build(source, safe_findings, coverage);
+        let report = Report::build(source, safe_findings, coverage, max_partial_percent);
         let aggregates = report
             .aggregates
             .into_iter()
@@ -244,6 +270,7 @@ impl UnsafeReport {
             source: report.source,
             scanned_at: report.scanned_at,
             coverage: report.coverage,
+            coverage_evaluation: report.coverage_evaluation,
             aggregates,
             total_findings: report.total_findings,
         }
@@ -270,7 +297,7 @@ impl UnsafeReport {
             self.aggregates.len(),
             self.total_findings
         )?;
-        write_human_coverage(&self.coverage, &mut w)?;
+        write_human_coverage(&self.coverage, &self.coverage_evaluation, &mut w)?;
         writeln!(w)?;
 
         if self.aggregates.is_empty() {
@@ -313,7 +340,23 @@ impl UnsafeReport {
     }
 }
 
-fn write_human_coverage(coverage: &ScanCoverage, mut w: impl Write) -> std::io::Result<()> {
+fn write_human_coverage(
+    coverage: &ScanCoverage,
+    evaluation: &CoverageEvaluation,
+    mut w: impl Write,
+) -> std::io::Result<()> {
+    if coverage.partial() {
+        writeln!(
+            w,
+            "!! PARTIAL COVERAGE — status={} incomplete={}/{} ({:.2}%) max={:.2}% recommended_exit={}",
+            evaluation.status.as_str(),
+            evaluation.incomplete_objects,
+            evaluation.attempted_objects,
+            evaluation.incomplete_percent,
+            evaluation.max_partial_percent,
+            evaluation.recommended_exit_code
+        )?;
+    }
     writeln!(
         w,
         "coverage: scanned={} object(s)/{} byte(s)  skipped={}  errors={}  truncated={}  partial={}",
@@ -323,6 +366,16 @@ fn write_human_coverage(coverage: &ScanCoverage, mut w: impl Write) -> std::io::
         coverage.source_errors().len(),
         coverage.truncated(),
         coverage.partial()
+    )?;
+    writeln!(
+        w,
+        "coverage policy: status={} incomplete={}/{} ({:.2}%) max={:.2}% recommended_exit={}",
+        evaluation.status.as_str(),
+        evaluation.incomplete_objects,
+        evaluation.attempted_objects,
+        evaluation.incomplete_percent,
+        evaluation.max_partial_percent,
+        evaluation.recommended_exit_code
     )?;
     if !coverage.source_errors().is_empty() {
         writeln!(w, "source errors:")?;
@@ -361,7 +414,7 @@ pub fn filter_unsafe_by_min_severity(
 mod tests {
     use super::*;
     use crate::detector::{Severity, scan_text_unredacted};
-    use crate::sources::{SourceError, SourceErrorKind};
+    use crate::sources::{COVERAGE_FAILURE_EXIT_CODE, SourceError, SourceErrorKind};
 
     fn finding(detector: &str, sev: Severity, raw: &str, loc: &str, line: u32) -> Finding {
         Finding::from_match(detector.into(), sev, loc.into(), line, raw, None)
@@ -420,6 +473,11 @@ mod tests {
         assert_eq!(value["coverage"]["source_errors"][0]["kind"], "read");
         assert_eq!(value["coverage"]["truncated"], true);
         assert_eq!(value["coverage"]["partial"], true);
+        assert_eq!(value["coverage_evaluation"]["status"], "truncated");
+        assert_eq!(
+            value["coverage_evaluation"]["recommended_exit_code"],
+            COVERAGE_FAILURE_EXIT_CODE
+        );
 
         let mut human = Vec::new();
         report.write_human(&mut human).unwrap();
@@ -427,6 +485,8 @@ mod tests {
         assert!(human.contains("scanned=1 object(s)/17 byte(s)"));
         assert!(human.contains("skipped=1  errors=1"));
         assert!(human.contains("truncated=true  partial=true"));
+        assert!(human.contains("!! PARTIAL COVERAGE"));
+        assert!(human.contains("status=truncated"));
         assert!(human.contains("synthetic/file: permission denied"));
     }
 
@@ -454,6 +514,24 @@ mod tests {
         assert_eq!(value["coverage"]["objects_scanned"], 1);
         assert_eq!(value["coverage"]["bytes_scanned"], key.len());
         assert_eq!(value["coverage"]["partial"], false);
+        assert_eq!(value["coverage_evaluation"]["status"], "complete");
+    }
+
+    #[test]
+    fn unsafe_report_preserves_coverage_failure_decision() {
+        let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
+        let mut outcome = ScanOutcome::from_findings(scan_text_unredacted(key, "a"));
+        outcome.record_scanned(key.len());
+        outcome.record_skipped();
+        let report = UnsafeReport::from_outcome_with_threshold("test", outcome, 10.0);
+        let mut json = Vec::new();
+        report.write_json(&mut json).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["coverage_evaluation"]["status"], "threshold_exceeded");
+        assert_eq!(
+            value["coverage_evaluation"]["recommended_exit_code"],
+            COVERAGE_FAILURE_EXIT_CODE
+        );
     }
 
     #[test]

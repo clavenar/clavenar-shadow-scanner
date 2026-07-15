@@ -34,7 +34,7 @@ No account, no sign-up — grab the static binary and run.
 runtime deps, no installer):
 
 ```bash
-V=0.1.4
+V=0.1.5
 curl -fsSL "https://github.com/clavenar/clavenar-shadow-scanner/releases/download/v${V}/clavenar-shadow-scanner-${V}-x86_64-linux-musl.tar.gz" \
   | tar -xz
 ./clavenar-shadow-scanner local ~
@@ -100,6 +100,8 @@ Output flags (`--unredacted` is local-only; the others are common):
                                   JSON / human output. Rejected remotely and with SARIF.
 --severity-min critical|high|medium|low
                                   Drop findings below this severity (default: low).
+--max-partial-percent 0..100      Maximum tolerated incomplete-object percentage
+                                  (default: 10). Truncation and total failure always fail.
 ```
 
 ### Coverage outcome
@@ -112,9 +114,21 @@ for Slack. `partial` is an invariant: any skip, source error, or truncation
 sets it to `true`; inconsistent coverage JSON is rejected on deserialization.
 
 Human and JSON reports show the complete coverage state. SARIF carries it at
-`runs[0].properties.coverage`. Explicit local unsafe reports use the same
-coverage model. GitHub preserves the recursive-tree API's `truncated` signal;
-returned blobs are still scanned, but `truncated=true` forces `partial=true`.
+`runs[0].properties.coverage`. Every format also carries a source-neutral
+`coverage_evaluation` with the status (`complete`,
+`partial_within_threshold`, `threshold_exceeded`, `truncated`, or
+`total_failure`), counts, configured maximum, percentage, and recommended exit
+code. Explicit local unsafe reports use the same coverage model. GitHub
+preserves the recursive-tree API's `truncated` signal; returned blobs are still
+scanned, but `truncated=true` forces `partial=true` and exit `3`.
+
+The incomplete percentage is
+`(objects_skipped + source_errors) / (objects_scanned + objects_skipped + source_errors) * 100`.
+The default maximum is 10%; exactly 10% is accepted and anything strictly above
+it exits `3`. Configure it with `--max-partial-percent`. A truncated scan or a
+partial scan with zero successfully scanned objects always exits `3`, even at a
+100% threshold. A genuinely empty, complete source exits `0` when it has no
+high/critical finding.
 
 Local `--secrets-mode` retains the normal gitignore-aware scan and supplements
 it with ignored credential-oriented names (`.env*`, private-key/container
@@ -129,7 +143,7 @@ unbounded traversal of every ignored dependency.
 ```yaml
 # .github/workflows/secrets-scan.yml
 - run: clavenar-shadow-scanner local . --sarif > results.sarif
-  continue-on-error: true       # exit 2 on findings — surface in the SARIF UI instead.
+  continue-on-error: true       # Preserve SARIF for upload on finding (2) or coverage failure (3).
 - uses: github/codeql-action/upload-sarif@v3
   with: { sarif_file: results.sarif }
 ```
@@ -151,8 +165,10 @@ auto-resolve once the secret is removed.
 ## Exit codes
 
 - `0` — no `high`/`critical` findings (or only `medium`/`low` findings).
-  Coverage can still be partial in this release; CI must inspect
-  `coverage.partial` until threshold-based exit enforcement lands.
+  Coverage is complete or partial within `--max-partial-percent`.
+- `3` — coverage is truncated, has no successfully scanned objects after a
+  source failure, or is strictly above the configured incomplete percentage.
+  Coverage failure takes precedence over finding exit `2`.
 - `2` — at least one `high` or `critical` finding. CI-friendly.
 - `1` — command setup or fatal runtime error before a typed outcome exists.
 

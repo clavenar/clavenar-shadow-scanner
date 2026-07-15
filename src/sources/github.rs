@@ -420,6 +420,7 @@ fn has_binary_extension(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::{CoverageEvaluation, CoverageStatus};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -505,6 +506,9 @@ mod tests {
         assert_eq!(outcome.coverage().bytes_scanned(), 8);
         assert!(outcome.coverage().truncated());
         assert!(outcome.coverage().partial());
+        let evaluation = CoverageEvaluation::evaluate(outcome.coverage(), 100.0);
+        assert_eq!(evaluation.status, CoverageStatus::Truncated);
+        assert!(evaluation.requires_failure());
     }
 
     #[tokio::test]
@@ -546,6 +550,9 @@ mod tests {
         );
         assert!(outcome.coverage().partial());
         assert!(!outcome.coverage().truncated());
+        let evaluation = CoverageEvaluation::evaluate(outcome.coverage(), 10.0);
+        assert_eq!(evaluation.status, CoverageStatus::ThresholdExceeded);
+        assert!(evaluation.requires_failure());
     }
 
     #[tokio::test]
@@ -562,5 +569,8 @@ mod tests {
             SourceErrorKind::Repository
         );
         assert!(outcome.coverage().partial());
+        let evaluation = CoverageEvaluation::evaluate(outcome.coverage(), 100.0);
+        assert_eq!(evaluation.status, CoverageStatus::TotalFailure);
+        assert!(evaluation.requires_failure());
     }
 }

@@ -80,6 +80,25 @@ struct OutputArgs {
     /// medium, low.
     #[arg(long, default_value = "low")]
     severity_min: String,
+    /// Maximum tolerated incomplete-object percentage. Total failure and
+    /// truncation always fail with exit 3 regardless of this value.
+    #[arg(
+        long,
+        default_value_t = sources::DEFAULT_MAX_PARTIAL_PERCENT,
+        value_parser = parse_partial_percent
+    )]
+    max_partial_percent: f64,
+}
+
+fn parse_partial_percent(value: &str) -> std::result::Result<f64, String> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| "must be a number from 0 through 100".to_string())?;
+    if value.is_finite() && (0.0..=100.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err("must be a finite number from 0 through 100".into())
+    }
 }
 
 #[tokio::main]
@@ -162,7 +181,7 @@ fn emit(
     let min = Severity::from_min(&out.severity_min)
         .with_context(|| format!("invalid --severity-min: {}", out.severity_min))?;
     let outcome = outcome.map_findings(|findings| filter_by_min_severity(findings, min));
-    let report = Report::from_outcome(source, outcome);
+    let report = Report::from_outcome_with_threshold(source, outcome, out.max_partial_percent);
     let mut stdout = stdout().lock();
     if out.sarif {
         report.write_sarif(&mut stdout)?;
@@ -171,8 +190,11 @@ fn emit(
     } else {
         report.write_human(&mut stdout)?;
     }
-    // Non-zero exit if any critical/high finding so CI integration is
-    // useful. Medium and low are informational.
+    if report.coverage_evaluation.requires_failure() {
+        std::process::exit(sources::COVERAGE_FAILURE_EXIT_CODE);
+    }
+    // Non-zero exit if any critical/high finding so CI integration is useful.
+    // Medium and low are informational. Coverage failure takes precedence.
     let any_high = report
         .aggregates
         .iter()
@@ -194,12 +216,16 @@ fn emit_unredacted(
     let min = Severity::from_min(&out.severity_min)
         .with_context(|| format!("invalid --severity-min: {}", out.severity_min))?;
     let outcome = outcome.map_findings(|findings| filter_unsafe_by_min_severity(findings, min));
-    let report = UnsafeReport::from_outcome(source, outcome);
+    let report =
+        UnsafeReport::from_outcome_with_threshold(source, outcome, out.max_partial_percent);
     let mut stdout = stdout().lock();
     if out.json {
         report.write_json(&mut stdout)?;
     } else {
         report.write_human(&mut stdout)?;
+    }
+    if report.coverage_evaluation.requires_failure() {
+        std::process::exit(sources::COVERAGE_FAILURE_EXIT_CODE);
     }
     let any_high = report
         .aggregates

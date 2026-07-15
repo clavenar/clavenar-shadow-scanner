@@ -93,6 +93,7 @@ pub(super) fn write(report: &Report, mut w: impl Write) -> std::io::Result<()> {
                 "scanned_at": report.scanned_at.to_rfc3339(),
                 "total_findings": report.total_findings,
                 "coverage": report.coverage,
+                "coverage_evaluation": report.coverage_evaluation,
             },
             "results": results,
         }],
@@ -264,5 +265,8 @@ mod tests {
         assert_eq!(coverage["objects_scanned"], 0);
         assert_eq!(coverage["source_errors"][0]["kind"], "tree");
         assert_eq!(coverage["partial"], true);
+        let evaluation = &value["runs"][0]["properties"]["coverage_evaluation"];
+        assert_eq!(evaluation["status"], "total_failure");
+        assert_eq!(evaluation["recommended_exit_code"], 3);
     }
 }

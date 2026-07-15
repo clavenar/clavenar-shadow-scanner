@@ -322,6 +322,7 @@ async fn read_scannable_file(path: &Path) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::{CoverageEvaluation, CoverageStatus};
     use std::fs;
     use tempfile::tempdir;
 
@@ -432,6 +433,9 @@ mod tests {
             SourceErrorKind::Walk
         );
         assert!(outcome.coverage().partial());
+        let evaluation = CoverageEvaluation::evaluate(outcome.coverage(), 100.0);
+        assert_eq!(evaluation.status, CoverageStatus::TotalFailure);
+        assert!(evaluation.requires_failure());
     }
 
     #[test]

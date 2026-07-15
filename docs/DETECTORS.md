@@ -27,9 +27,13 @@ window. Context is omitted if the window includes an unscanned line over
 defaults use only the raw-free safe model.
 
 Severity is load-bearing. The CLI's `emit` (in
-[`src/main.rs`](../src/main.rs)) exits `2` when any surviving aggregate
-is `Critical` or `High`, and `0` otherwise — so `Medium`/`Low` findings
-are informational and never fail CI. A runtime error exits `1`.
+[`src/main.rs`](../src/main.rs)) first evaluates source coverage, exiting `3`
+for total failure, truncation, or an incomplete percentage strictly above
+`--max-partial-percent` (default 10). That decision takes precedence over
+findings. With accepted coverage, it exits `2` when any surviving aggregate is
+`Critical` or `High`, and `0` otherwise — so `Medium`/`Low` findings are
+informational and never fail CI. A setup or fatal runtime error before a typed
+outcome exits `1`.
 `Severity` orders `Critical < High < Medium < Low`, which is why
 `--severity-min` filtering and the "higher tier wins" aggregate merge in
 [`src/output/mod.rs`](../src/output/mod.rs) treat the smaller ordinal as
@@ -150,8 +154,9 @@ source access.
   four-tier severity onto SARIF's three levels: `Critical`/`High` →
   `error`, `Medium` → `warning`, `Low` → `note`.
 - **Properties bag.** `runs[0].properties` carries `source`,
-  `scanned_at` (RFC 3339), `total_findings`, and the typed `coverage`
-  object; SARIF parsers ignore unknown keys.
+  `scanned_at` (RFC 3339), `total_findings`, the typed `coverage` object, and
+  `coverage_evaluation` (status, attempted/incomplete counts, percentage,
+  maximum, and recommended exit); SARIF parsers ignore unknown keys.
 
 ---
 *Re-verify against `build_detectors` / `Severity` in

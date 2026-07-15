@@ -7,6 +7,99 @@ pub mod github;
 pub mod local;
 pub mod slack;
 
+pub const DEFAULT_MAX_PARTIAL_PERCENT: f64 = 10.0;
+pub const COVERAGE_FAILURE_EXIT_CODE: i32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageStatus {
+    Complete,
+    PartialWithinThreshold,
+    ThresholdExceeded,
+    Truncated,
+    TotalFailure,
+}
+
+impl CoverageStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::PartialWithinThreshold => "partial_within_threshold",
+            Self::ThresholdExceeded => "threshold_exceeded",
+            Self::Truncated => "truncated",
+            Self::TotalFailure => "total_failure",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoverageEvaluation {
+    pub status: CoverageStatus,
+    pub attempted_objects: u64,
+    pub incomplete_objects: u64,
+    pub incomplete_percent: f64,
+    pub max_partial_percent: f64,
+    pub recommended_exit_code: i32,
+}
+
+impl CoverageEvaluation {
+    pub fn evaluate(coverage: &ScanCoverage, max_partial_percent: f64) -> Self {
+        let max_partial_percent =
+            if max_partial_percent.is_finite() && (0.0..=100.0).contains(&max_partial_percent) {
+                max_partial_percent
+            } else {
+                0.0
+            };
+        let error_count = coverage.source_errors.len() as u64;
+        let incomplete_objects = coverage.objects_skipped.saturating_add(error_count);
+        let attempted_objects = coverage.objects_scanned.saturating_add(incomplete_objects);
+        let incomplete_percent = if attempted_objects == 0 {
+            0.0
+        } else {
+            incomplete_objects as f64 / attempted_objects as f64 * 100.0
+        };
+        let status = if !coverage.partial {
+            CoverageStatus::Complete
+        } else if coverage.truncated {
+            CoverageStatus::Truncated
+        } else if coverage.objects_scanned == 0 {
+            CoverageStatus::TotalFailure
+        } else if incomplete_percent > max_partial_percent {
+            CoverageStatus::ThresholdExceeded
+        } else {
+            CoverageStatus::PartialWithinThreshold
+        };
+        let recommended_exit_code = if matches!(
+            status,
+            CoverageStatus::ThresholdExceeded
+                | CoverageStatus::Truncated
+                | CoverageStatus::TotalFailure
+        ) {
+            COVERAGE_FAILURE_EXIT_CODE
+        } else {
+            0
+        };
+        Self {
+            status,
+            attempted_objects,
+            incomplete_objects,
+            incomplete_percent,
+            max_partial_percent,
+            recommended_exit_code,
+        }
+    }
+
+    pub fn requires_failure(&self) -> bool {
+        self.recommended_exit_code == COVERAGE_FAILURE_EXIT_CODE
+    }
+}
+
+impl Default for CoverageEvaluation {
+    fn default() -> Self {
+        Self::evaluate(&ScanCoverage::default(), DEFAULT_MAX_PARTIAL_PERCENT)
+    }
+}
+
 /// Stable source-stage classification for an item that could not be scanned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -287,5 +380,51 @@ mod tests {
             r#"{"objects_scanned":0,"bytes_scanned":0,"objects_skipped":1,"source_errors":[],"truncated":false,"partial":false}"#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn coverage_policy_is_strictly_above_threshold() {
+        let mut outcome = ScanOutcome::<()>::default();
+        for _ in 0..9 {
+            outcome.record_scanned(1);
+        }
+        outcome.record_skipped();
+        let at_threshold = CoverageEvaluation::evaluate(outcome.coverage(), 10.0);
+        assert_eq!(at_threshold.status, CoverageStatus::PartialWithinThreshold);
+        assert_eq!(at_threshold.incomplete_percent, 10.0);
+        assert!(!at_threshold.requires_failure());
+
+        let above_threshold = CoverageEvaluation::evaluate(outcome.coverage(), 9.9);
+        assert_eq!(above_threshold.status, CoverageStatus::ThresholdExceeded);
+        assert!(above_threshold.requires_failure());
+    }
+
+    #[test]
+    fn total_failure_and_truncation_always_fail() {
+        let mut total = ScanOutcome::<()>::default();
+        total.record_error(SourceError::new(
+            SourceErrorKind::Read,
+            "fixture",
+            "unavailable",
+        ));
+        let total = CoverageEvaluation::evaluate(total.coverage(), 100.0);
+        assert_eq!(total.status, CoverageStatus::TotalFailure);
+        assert!(total.requires_failure());
+
+        let mut truncated = ScanOutcome::<()>::default();
+        truncated.mark_truncated();
+        let truncated = CoverageEvaluation::evaluate(truncated.coverage(), 100.0);
+        assert_eq!(truncated.status, CoverageStatus::Truncated);
+        assert!(truncated.requires_failure());
+    }
+
+    #[test]
+    fn invalid_library_threshold_fails_closed_to_zero() {
+        let mut outcome = ScanOutcome::<()>::default();
+        outcome.record_scanned(1);
+        outcome.record_skipped();
+        let evaluation = CoverageEvaluation::evaluate(outcome.coverage(), f64::NAN);
+        assert_eq!(evaluation.max_partial_percent, 0.0);
+        assert_eq!(evaluation.status, CoverageStatus::ThresholdExceeded);
     }
 }
