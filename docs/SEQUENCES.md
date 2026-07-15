@@ -38,7 +38,7 @@ sequenceDiagram
     Op->>Main: clavenar-shadow-scanner subcommand [...]
     Main->>Main: tracing_subscriber::registry + EnvFilter (default warn, stderr writer)
     Main->>Cli: parse argv + env
-    Cli-->>Main: Cli { command, OutputArgs { json, sarif, unredacted, severity_min } }
+    Cli-->>Main: Cli { command, local secrets_mode, OutputArgs { json, sarif, unredacted, severity_min } }
     break Command::Local with --unredacted
         Main->>Run: run_local(path, out)
         Run->>Src: sources::local::scan_directory_unredacted(path)
@@ -51,8 +51,8 @@ sequenceDiagram
         Out-->>Op: visibly marked secret-bearing payload
     end
     alt Command::Local safe default
-        Main->>Run: run_local(path, out)
-        Run->>Src: sources::local::scan_directory(path)
+        Main->>Run: run_local(path, secrets_mode, out)
+        Run->>Src: sources::local::scan_directory_with_mode(path, mode)
     else Command::Github
         Main->>Run: run_github(owner_arg, include_forks, include_archived, out)
         Run->>Run: reject --unredacted before client/source access
@@ -91,9 +91,12 @@ sequenceDiagram
 
 ## 2. `local` — gitignore-aware filesystem walk
 
-`scan_directory` pushes the synchronous `ignore::WalkBuilder` walk
-onto the blocking pool, collects every candidate path into a Vec,
-then reads + scans each file asynchronously. Per-file the metadata
+`scan_directory_with_mode` canonicalizes the requested root, pushes the
+synchronous `ignore::WalkBuilder` walk onto the blocking pool, deduplicates
+candidate paths, then reads + scans each file asynchronously. Standard mode
+uses normal ignore filters while excluding VCS internals and symlinks. Secrets
+mode supplements that set with ignored credential-oriented filenames, without
+entering VCS, dependency, build, virtualenv, or cache directories. Per-file the metadata
 size cap, the NUL-byte binary heuristic, and the UTF-8 check all
 short-circuit before any regex work. Individual file failures become
 structured source errors while other readable files continue. Every scanned,
@@ -109,11 +112,15 @@ sequenceDiagram
     participant Tokio as tokio::fs
     participant Det as scan_text
 
-    Run->>Scan: scan_directory(root: &Path)
-    Scan->>Gather: tokio::task::spawn_blocking gather_paths(root.clone)
+    Run->>Scan: scan_directory_with_mode(root, Standard or Secrets)
+    Scan->>Gather: tokio::task::spawn_blocking gather_paths(root.clone, mode)
     activate Gather
-    Gather->>Ignore: WalkBuilder::new(root).standard_filters(true).hidden(false).build
-    Note over Ignore: .gitignore-aware,<br/>still descends into dotfiles like .env
+    Gather->>Gather: canonicalize root or record one walk error
+    Gather->>Ignore: standard WalkBuilder with ignore filters + no symlinks/VCS internals
+    opt mode == Secrets
+        Gather->>Ignore: supplemental no-ignore walker filtered to credential names + safe directories
+    end
+    Note over Ignore: secrets mode includes ignored .env/key/credential files<br/>without unbounded ignored dependency traversal
     loop walker entries
         Ignore-->>Gather: DirEntry or error
         alt walk error
@@ -124,7 +131,8 @@ sequenceDiagram
             Gather->>Gather: skip
         end
     end
-    Gather-->>Scan: GatheredPaths { paths, errors }
+    Gather->>Gather: BTreeSet dedupe paths from both walks
+    Gather-->>Scan: GatheredPaths { canonical paths, errors }
     deactivate Gather
     loop every collected path
         Scan->>Scan: scan_one_file(path)
@@ -213,8 +221,11 @@ sequenceDiagram
         else
             Scan->>Tree: list_tree(owner, repo.name, repo.default_branch)
             Tree->>Gh: GET /repos/.../git/trees/{branch}?recursive=1
-            Gh-->>Tree: TreeResponse (filtered to kind == blob)
-            Tree-->>Scan: VecTreeEntry
+            Gh-->>Tree: TreeResponse { tree, truncated }
+            Tree-->>Scan: TreeListing { blob entries, truncated }
+            opt truncated == true
+                Scan->>Scan: mark coverage truncated + partial
+            end
             loop every blob
                 alt size > MAX_FILE_BYTES OR has_binary_extension(path)
                     Scan->>Scan: record skipped blob
@@ -400,7 +411,7 @@ flowchart TD
     Tracing --> Parse[clap Cli parse + OutputArgs flatten]
     Parse --> Sub{subcommand}
 
-    Sub -->|local path| L[safe scan_directory by default<br/>explicit unsafe local path only<br/>per-file size + binary + utf8 gates]
+    Sub -->|local path| L[standard gitignore-aware scan<br/>optional --secrets-mode ignored credential supplement<br/>canonical root, no symlinks or unsafe internals<br/>per-file size + binary + utf8 gates]
     Sub -->|github owner or owner/repo| G[reject --unredacted before access<br/>GITHUB_TOKEN optional, 60 rph fallback<br/>orgs then users endpoint fallback<br/>rate-limit + 429 retry loop]
     Sub -->|slack --days N| S[reject --unredacted before access<br/>SLACK_BOT_TOKEN required else bail<br/>cursored list_conversations + fetch_history<br/>skip archived + non-member]
 

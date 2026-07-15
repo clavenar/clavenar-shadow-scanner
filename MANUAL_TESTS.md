@@ -56,6 +56,22 @@ release candidate.
 5. Repeat the complete synthetic-credential corpus and confirm adding coverage
    metadata does not place any raw value in default human, JSON, or SARIF.
 
+## GitHub truncation and safe ignored-file mode
+
+1. Run the deterministic GitHub mock tests. Confirm a recursive-tree response
+   with `truncated=true` retains returned blob findings/counts while setting
+   both `coverage.truncated` and `coverage.partial`; confirm one failed blob in
+   a mixed tree leaves the successful count and adds a structured `blob` error.
+2. Create a temporary Git repository whose `.gitignore` excludes a synthetic
+   `.env` credential. Confirm the standard local scan does not report it and
+   `local <path> --secrets-mode` does, with redacted output.
+3. Put separate synthetic credentials in `.git/config`,
+   `node_modules/.env`, and a file outside the root reached only by a symlink.
+   Confirm secrets mode reports none of them and records no path outside the
+   canonical root.
+4. Confirm secrets mode deduplicates files seen by both walks and retains the
+   size, binary, and invalid-UTF-8 skips from the standard scanner.
+
 ## Static release artifact
 
 1. Download the tarball and `.sha256` companion for the target architecture.

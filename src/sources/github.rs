@@ -179,15 +179,22 @@ impl GitHubClient {
         Ok(all)
     }
 
-    /// Recursive tree listing for a repo at a given branch. Returns
-    /// every blob path (no directories).
-    pub async fn list_tree(&self, owner: &str, repo: &str, branch: &str) -> Result<Vec<TreeEntry>> {
+    /// Recursive tree listing for a repo at a given branch. Preserves GitHub's
+    /// truncation signal and returns every blob path in the response.
+    pub async fn list_tree(&self, owner: &str, repo: &str, branch: &str) -> Result<TreeListing> {
         let url = format!(
             "{}/repos/{}/{}/git/trees/{}?recursive=1",
             self.base_url, owner, repo, branch
         );
         let tree: TreeResponse = self.get_json(&url).await?;
-        Ok(tree.tree.into_iter().filter(|t| t.kind == "blob").collect())
+        Ok(TreeListing {
+            entries: tree
+                .tree
+                .into_iter()
+                .filter(|entry| entry.kind == "blob")
+                .collect(),
+            truncated: tree.truncated,
+        })
     }
 
     pub async fn get_repo(&self, owner: &str, repo: &str) -> Result<RepoSummary> {
@@ -224,6 +231,14 @@ pub struct RepoSummary {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TreeResponse {
     pub tree: Vec<TreeEntry>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TreeListing {
+    pub entries: Vec<TreeEntry>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -346,7 +361,10 @@ async fn scan_repo(client: &GitHubClient, owner: &str, repo: &RepoSummary) -> Sc
             return outcome;
         }
     };
-    for entry in tree {
+    if tree.truncated {
+        outcome.mark_truncated();
+    }
+    for entry in tree.entries {
         // Skip oversized blobs and obviously-binary paths.
         if entry.size.unwrap_or(0) > MAX_FILE_BYTES {
             outcome.record_skipped();
@@ -402,6 +420,51 @@ fn has_binary_extension(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    struct MockResponse {
+        path: &'static str,
+        status: &'static str,
+        body: &'static str,
+    }
+
+    fn mock_github(responses: Vec<MockResponse>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 8192];
+                let length = stream.read(&mut request).unwrap();
+                let request = std::str::from_utf8(&request[..length]).unwrap();
+                let request_path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap();
+                assert_eq!(request_path, response.path);
+                write!(
+                    stream,
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.status,
+                    response.body.len(),
+                    response.body
+                )
+                .unwrap();
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    const REPO_RESPONSE: &str = r#"{
+        "name":"repo",
+        "full_name":"owner/repo",
+        "default_branch":"main",
+        "fork":false,
+        "archived":false
+    }"#;
 
     #[test]
     fn binary_extensions_recognised() {
@@ -410,6 +473,79 @@ mod tests {
         assert!(has_binary_extension("path/to/lib.so"));
         assert!(!has_binary_extension("README.md"));
         assert!(!has_binary_extension("src/main.rs"));
+    }
+
+    #[tokio::test]
+    async fn truncated_tree_sets_typed_partial_coverage_and_keeps_results() {
+        let (base_url, server) = mock_github(vec![
+            MockResponse {
+                path: "/repos/owner/repo",
+                status: "200 OK",
+                body: REPO_RESPONSE,
+            },
+            MockResponse {
+                path: "/repos/owner/repo/git/trees/main?recursive=1",
+                status: "200 OK",
+                body: r#"{"tree":[{"path":"README.md","type":"blob","size":8}],"truncated":true}"#,
+            },
+            MockResponse {
+                path: "/repos/owner/repo/contents/README.md?ref=main",
+                status: "200 OK",
+                body: "# clean\n",
+            },
+        ]);
+        let client = GitHubClient::from_env().with_base_url(base_url);
+        let outcome = scan_owner(&client, "owner", Some("repo"), false, false)
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert!(outcome.findings.is_empty());
+        assert_eq!(outcome.coverage().objects_scanned(), 1);
+        assert_eq!(outcome.coverage().bytes_scanned(), 8);
+        assert!(outcome.coverage().truncated());
+        assert!(outcome.coverage().partial());
+    }
+
+    #[tokio::test]
+    async fn mixed_blob_failure_retains_success_and_structured_error() {
+        let (base_url, server) = mock_github(vec![
+            MockResponse {
+                path: "/repos/owner/repo",
+                status: "200 OK",
+                body: REPO_RESPONSE,
+            },
+            MockResponse {
+                path: "/repos/owner/repo/git/trees/main?recursive=1",
+                status: "200 OK",
+                body: r#"{"tree":[{"path":"good.txt","type":"blob","size":6},{"path":"bad.txt","type":"blob","size":5}],"truncated":false}"#,
+            },
+            MockResponse {
+                path: "/repos/owner/repo/contents/good.txt?ref=main",
+                status: "200 OK",
+                body: "clean\n",
+            },
+            MockResponse {
+                path: "/repos/owner/repo/contents/bad.txt?ref=main",
+                status: "500 Internal Server Error",
+                body: r#"{"message":"synthetic failure"}"#,
+            },
+        ]);
+        let client = GitHubClient::from_env().with_base_url(base_url);
+        let outcome = scan_owner(&client, "owner", Some("repo"), false, false)
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(outcome.coverage().objects_scanned(), 1);
+        assert_eq!(outcome.coverage().bytes_scanned(), 6);
+        assert_eq!(outcome.coverage().source_errors().len(), 1);
+        assert_eq!(
+            outcome.coverage().source_errors()[0].kind,
+            SourceErrorKind::Blob
+        );
+        assert!(outcome.coverage().partial());
+        assert!(!outcome.coverage().truncated());
     }
 
     #[tokio::test]

@@ -31,6 +31,10 @@ enum Command {
     /// Scan a local directory.
     Local {
         path: PathBuf,
+        /// Supplement the normal walk with ignored credential-oriented files.
+        /// Never follows symlinks or enters VCS/dependency/build internals.
+        #[arg(long)]
+        secrets_mode: bool,
         #[command(flatten)]
         out: OutputArgs,
     },
@@ -88,7 +92,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Local { path, out } => run_local(path, out).await,
+        Command::Local {
+            path,
+            secrets_mode,
+            out,
+        } => run_local(path, secrets_mode, out).await,
         Command::Github {
             owner,
             include_forks,
@@ -99,13 +107,18 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_local(path: PathBuf, out: OutputArgs) -> Result<()> {
+async fn run_local(path: PathBuf, secrets_mode: bool, out: OutputArgs) -> Result<()> {
     let source = format!("local:{}", path.display());
+    let mode = if secrets_mode {
+        sources::local::LocalScanMode::Secrets
+    } else {
+        sources::local::LocalScanMode::Standard
+    };
     if out.unredacted {
-        let outcome = sources::local::scan_directory_unredacted(&path).await?;
+        let outcome = sources::local::scan_directory_unredacted_with_mode(&path, mode).await?;
         emit_unredacted(&source, outcome, out)
     } else {
-        let outcome = sources::local::scan_directory(&path).await?;
+        let outcome = sources::local::scan_directory_with_mode(&path, mode).await?;
         emit(&source, outcome, out)
     }
 }

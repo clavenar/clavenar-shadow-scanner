@@ -24,4 +24,5 @@ pub use detector::{
     Detector, Finding, Severity, UnsafeFinding, detectors, redact, scan_text, scan_text_unredacted,
     shannon_entropy,
 };
+pub use sources::local::LocalScanMode;
 pub use sources::{ScanCoverage, ScanOutcome, SourceError, SourceErrorKind};

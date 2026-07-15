@@ -34,7 +34,7 @@ No account, no sign-up — grab the static binary and run.
 runtime deps, no installer):
 
 ```bash
-V=0.1.3
+V=0.1.4
 curl -fsSL "https://github.com/clavenar/clavenar-shadow-scanner/releases/download/v${V}/clavenar-shadow-scanner-${V}-x86_64-linux-musl.tar.gz" \
   | tar -xz
 ./clavenar-shadow-scanner local ~
@@ -56,6 +56,9 @@ cargo install --git https://github.com/clavenar/clavenar-shadow-scanner
 ```bash
 # Scan your laptop's home directory.
 clavenar-shadow-scanner local ~
+
+# Also scan ignored credential-oriented files such as .env.production.
+clavenar-shadow-scanner local . --secrets-mode
 
 # Scan one repo on GitHub. (Set GITHUB_TOKEN — public API caps at 60 req/hr.)
 GITHUB_TOKEN=ghp_… clavenar-shadow-scanner github clavenar/clavenar-proxy
@@ -80,6 +83,7 @@ Snyk, and most modern code-review tools — structurally redacted).
 
 ```
 local <path>                      Scan a directory (gitignore-aware).
+  --secrets-mode                 Also scan ignored credential-oriented files.
 github <owner>[/<repo>] [...]     Scan one repo or every repo under an owner.
   --include-forks                 Also scan forked repos.
   --include-archived              Also scan archived repos.
@@ -109,9 +113,16 @@ sets it to `true`; inconsistent coverage JSON is rejected on deserialization.
 
 Human and JSON reports show the complete coverage state. SARIF carries it at
 `runs[0].properties.coverage`. Explicit local unsafe reports use the same
-coverage model. In this release `truncated` is schema-backed, but GitHub's
-recursive-tree truncation signal is not yet detected; a `false` value does not
-by itself prove the GitHub API returned the complete tree.
+coverage model. GitHub preserves the recursive-tree API's `truncated` signal;
+returned blobs are still scanned, but `truncated=true` forces `partial=true`.
+
+Local `--secrets-mode` retains the normal gitignore-aware scan and supplements
+it with ignored credential-oriented names (`.env*`, private-key/container
+suffixes, common credential files, and secret manifests). The supplemental
+walk is canonical-root confined, does not follow symlinks, excludes VCS
+internals and dependency/build/cache directories, deduplicates paths, and keeps
+the same 1 MiB, binary, and UTF-8 guards. It is broader for secrets, not an
+unbounded traversal of every ignored dependency.
 
 ### CI integration
 

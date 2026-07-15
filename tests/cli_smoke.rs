@@ -223,3 +223,40 @@ fn severity_min_filters_below_threshold() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn secrets_mode_adds_gitignored_credential_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+    std::fs::write(dir.path().join(".gitignore"), ".env\n").unwrap();
+    let key = "sk-ant-api03-EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE-eZbYcXdW";
+    std::fs::write(dir.path().join(".env"), format!("KEY={key}\n")).unwrap();
+
+    let standard = Command::new(cargo_bin())
+        .arg("local")
+        .arg(dir.path())
+        .arg("--json")
+        .output()
+        .expect("run standard scan");
+    assert_eq!(standard.status.code(), Some(0));
+    let standard_json: serde_json::Value = serde_json::from_slice(&standard.stdout).unwrap();
+    assert_eq!(standard_json["total_findings"], 0);
+
+    let secrets = Command::new(cargo_bin())
+        .arg("local")
+        .arg(dir.path())
+        .arg("--secrets-mode")
+        .arg("--json")
+        .output()
+        .expect("run secrets scan");
+    assert_eq!(secrets.status.code(), Some(2));
+    let secrets_json: serde_json::Value = serde_json::from_slice(&secrets.stdout).unwrap();
+    assert!(secrets_json["total_findings"].as_u64().unwrap() > 0);
+    assert!(
+        secrets_json["coverage"]["objects_scanned"]
+            .as_u64()
+            .unwrap()
+            >= 2
+    );
+    assert!(!String::from_utf8_lossy(&secrets.stdout).contains(key));
+}
