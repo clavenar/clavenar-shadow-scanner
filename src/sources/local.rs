@@ -11,7 +11,7 @@
 //! [`tokio::task::spawn_blocking`] to avoid stalling the runtime.
 
 use super::{MAX_FILE_BYTES, looks_binary};
-use crate::detector::{Finding, scan_text};
+use crate::detector::{Finding, UnsafeFinding, scan_text, scan_text_unredacted};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -34,6 +34,24 @@ pub async fn scan_directory(root: &Path) -> Result<Vec<Finding>> {
         match scan_one_file(&path).await {
             Ok(mut fs) => findings.append(&mut fs),
             Err(e) => tracing::warn!("skip {}: {}", path.display(), e),
+        }
+    }
+    Ok(findings)
+}
+
+/// Explicit local-only scan that retains raw matches for visibly marked unsafe
+/// output. Remote sources do not expose an equivalent entry point.
+pub async fn scan_directory_unredacted(root: &Path) -> Result<Vec<UnsafeFinding>> {
+    let root = root.to_path_buf();
+    let paths: Vec<PathBuf> = tokio::task::spawn_blocking(move || gather_paths(&root))
+        .await
+        .context("spawn_blocking gather_paths")??;
+
+    let mut findings = Vec::new();
+    for path in paths {
+        match scan_one_file_unredacted(&path).await {
+            Ok(mut file_findings) => findings.append(&mut file_findings),
+            Err(error) => tracing::warn!("skip {}: {}", path.display(), error),
         }
     }
     Ok(findings)
@@ -68,6 +86,20 @@ fn gather_paths(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 async fn scan_one_file(path: &Path) -> Result<Vec<Finding>> {
+    let Some(text) = read_scannable_file(path).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(scan_text(&text, &path.display().to_string()))
+}
+
+async fn scan_one_file_unredacted(path: &Path) -> Result<Vec<UnsafeFinding>> {
+    let Some(text) = read_scannable_file(path).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(scan_text_unredacted(&text, &path.display().to_string()))
+}
+
+async fn read_scannable_file(path: &Path) -> Result<Option<String>> {
     let metadata = tokio::fs::metadata(path)
         .await
         .with_context(|| format!("stat {}", path.display()))?;
@@ -77,20 +109,19 @@ async fn scan_one_file(path: &Path) -> Result<Vec<Finding>> {
             path.display(),
             metadata.len()
         );
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let bytes = tokio::fs::read(path)
         .await
         .with_context(|| format!("read {}", path.display()))?;
     if looks_binary(&bytes) {
         tracing::debug!("skip binary {}", path.display());
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(s) => s,
-        Err(_) => return Ok(Vec::new()), // not UTF-8, skip
-    };
-    Ok(scan_text(text, &path.display().to_string()))
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(Some(text)),
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]

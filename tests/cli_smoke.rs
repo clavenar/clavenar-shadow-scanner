@@ -74,10 +74,36 @@ fn unredacted_flag_includes_raw_key() {
         .output()
         .expect("run binary");
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(2));
     assert!(
         stdout.contains(key),
         "expected raw key in unredacted output"
     );
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("unsafe JSON report");
+    assert_eq!(report["unsafe_output"], true);
+    assert!(
+        report["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("live secrets"))
+    );
+}
+
+#[test]
+fn unredacted_human_output_includes_raw_key_and_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = "sk-ant-api03-JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ-deadbeef";
+    std::fs::write(dir.path().join(".env"), format!("KEY={key}")).unwrap();
+
+    let output = Command::new(cargo_bin())
+        .arg("local")
+        .arg(dir.path())
+        .arg("--unredacted")
+        .output()
+        .expect("run binary");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout.starts_with("!! UNREDACTED OUTPUT"));
+    assert!(stdout.contains(key));
 }
 
 #[test]
@@ -123,6 +149,42 @@ fn sarif_and_json_are_mutually_exclusive() {
         "expected clap conflict error, got: {}",
         stderr
     );
+}
+
+#[test]
+fn sarif_and_unredacted_are_mutually_exclusive() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(cargo_bin())
+        .arg("local")
+        .arg(dir.path())
+        .arg("--sarif")
+        .arg("--unredacted")
+        .output()
+        .expect("run binary");
+    assert_ne!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--unredacted") && stderr.contains("--sarif"));
+}
+
+#[test]
+fn remote_sources_reject_unredacted_before_access() {
+    for args in [
+        ["github", "example", "--unredacted"].as_slice(),
+        ["slack", "--unredacted"].as_slice(),
+    ] {
+        let output = Command::new(cargo_bin())
+            .args(args)
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("SLACK_BOT_TOKEN")
+            .output()
+            .expect("run binary");
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("restricted to local scans"),
+            "unexpected stderr: {stderr}"
+        );
+    }
 }
 
 #[test]

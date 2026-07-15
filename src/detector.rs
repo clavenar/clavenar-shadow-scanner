@@ -13,11 +13,11 @@
 //!
 //! ## Output safety
 //!
-//! Findings hold the **raw** secret in [`Finding::raw_match`] (so callers
-//! that need to verify the hit can do so), but every formatter MUST go
-//! through redacted forms for human consumption. The CLI redacts by
-//! default; `--unredacted` flips it back at the user's explicit request,
-//! with a banner reminding them they're producing a secrets file.
+//! [`Finding`] is safe by construction: it stores only a fingerprint,
+//! redacted display value, and redacted context. The default scan path drops
+//! matched plaintext before returning. Raw values exist only in the explicitly
+//! named [`UnsafeFinding`] returned by [`scan_text_unredacted`], which the CLI
+//! exposes for local scans only.
 //!
 //! Generic-detector entropy floor is 4.0 bits/byte: random base64 lands
 //! 4.5–5.5, English prose ~4.0, so 4.0 + a length floor keeps short
@@ -70,33 +70,88 @@ pub struct Finding {
     /// `owner/repo:path@ref` for GitHub, `slack://channel/ts` for Slack.
     pub location: String,
     pub line: u32,
-    /// The exact substring that matched. **Treat as a secret.** Formatters
-    /// must redact unless the user explicitly opts in.
-    pub raw_match: String,
+    /// Stable SHA-256-derived identifier used for deduplication.
+    pub fingerprint: String,
+    /// Non-recoverable display form (`<first 4>…<last 4>` for long values).
+    pub redacted: String,
     /// ±2 lines of source context, with the secret already redacted in
     /// place. Safe to display.
     pub context: Option<String>,
 }
 
 impl Finding {
-    /// Stable hash of the raw secret for dedup. SHA-256 truncated to 16
-    /// hex chars — collision-resistant enough for reporting; cheap to
-    /// compare.
-    pub fn fingerprint(&self) -> String {
-        let mut hasher = sha2::Sha256::new();
-        use sha2::Digest;
-        hasher.update(self.raw_match.as_bytes());
-        let digest = hasher.finalize();
-        hex::encode(&digest[..8])
+    pub(crate) fn from_match(
+        detector: String,
+        severity: Severity,
+        location: String,
+        line: u32,
+        raw_match: &str,
+        context: Option<String>,
+    ) -> Self {
+        Self {
+            detector,
+            severity,
+            location,
+            line,
+            fingerprint: fingerprint(raw_match),
+            redacted: redact(raw_match),
+            context,
+        }
     }
 
-    /// Return `<first 4>…<last 4>` for any token longer than 12 chars,
-    /// otherwise `<redacted>`. The "show edges" pattern lets reviewers
-    /// recognise a key they've seen elsewhere without exposing the
-    /// middle.
-    pub fn redacted(&self) -> String {
-        redact(&self.raw_match)
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
+
+    pub fn redacted(&self) -> &str {
+        &self.redacted
+    }
+}
+
+/// A finding that deliberately retains matched plaintext for explicit local
+/// unsafe output. It is intentionally not serializable and its `Debug`
+/// implementation delegates to the safe finding so logs cannot expose raw
+/// material accidentally.
+#[derive(Clone)]
+pub struct UnsafeFinding {
+    safe: Finding,
+    raw_match: String,
+}
+
+impl std::fmt::Debug for UnsafeFinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnsafeFinding")
+            .field("safe", &self.safe)
+            .field("raw_match", &"<redacted>")
+            .finish()
+    }
+}
+
+impl UnsafeFinding {
+    pub fn safe(&self) -> &Finding {
+        &self.safe
+    }
+
+    pub fn raw_secret(&self) -> &str {
+        &self.raw_match
+    }
+
+    pub fn into_safe(self) -> Finding {
+        self.safe
+    }
+
+    pub(crate) fn into_parts(self) -> (Finding, String) {
+        (self.safe, self.raw_match)
+    }
+}
+
+fn fingerprint(raw_match: &str) -> String {
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    hasher.update(raw_match.as_bytes());
+    let digest = hasher.finalize();
+    hex::encode(&digest[..8])
 }
 
 pub fn redact(s: &str) -> String {
@@ -529,6 +584,15 @@ struct PendingFinding<'a> {
 /// complete set redacted. This prevents one finding's context from exposing a
 /// second credential on the same or a neighboring line.
 pub fn scan_text(text: &str, location: &str) -> Vec<Finding> {
+    scan_text_unredacted(text, location)
+        .into_iter()
+        .map(UnsafeFinding::into_safe)
+        .collect()
+}
+
+/// Scan while deliberately retaining raw matched values. Callers must keep
+/// this path local and visibly mark every output as secret-bearing.
+pub fn scan_text_unredacted(text: &str, location: &str) -> Vec<UnsafeFinding> {
     let lines = source_lines(text);
     let mut pending = Vec::new();
     for (line_idx, line) in lines.iter().enumerate() {
@@ -575,17 +639,24 @@ pub fn scan_text(text: &str, location: &str) -> Vec<Finding> {
     let redaction_spans = merge_spans(pending.iter().map(|finding| finding.span.clone()));
     pending
         .into_iter()
-        .map(|finding| Finding {
-            detector: finding.detector.name.to_string(),
-            severity: finding.detector.severity,
-            location: location.to_string(),
-            line: (finding.line_idx + 1) as u32,
-            raw_match: text[finding.span.clone()].to_string(),
-            context: if finding.context_allowed {
+        .map(|finding| {
+            let raw_match = &text[finding.span.clone()];
+            let context = if finding.context_allowed {
                 build_context(text, &lines, finding.line_idx, &redaction_spans)
             } else {
                 None
-            },
+            };
+            UnsafeFinding {
+                safe: Finding::from_match(
+                    finding.detector.name.to_string(),
+                    finding.detector.severity,
+                    location.to_string(),
+                    (finding.line_idx + 1) as u32,
+                    raw_match,
+                    context,
+                ),
+                raw_match: raw_match.to_string(),
+            }
         })
         .collect()
 }
@@ -1078,8 +1149,8 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         let github = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let text = format!("ANTHROPIC={anthropic} GITHUB={github}");
         let findings = scan_text(&text, "same-line");
-        assert!(findings.iter().any(|f| f.raw_match == anthropic));
-        assert!(findings.iter().any(|f| f.raw_match == github));
+        assert!(findings.iter().any(|f| f.detector == "anthropic_api_key"));
+        assert!(findings.iter().any(|f| f.detector == "github_pat"));
         for finding in findings {
             let context = finding.context.expect("safe context");
             assert!(!context.contains(anthropic));
@@ -1127,13 +1198,17 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
             "SyntheticPrivateKeyBodyLineTwo9xYz\n",
             "-----END RSA PRIVATE KEY-----"
         );
-        let findings = scan_text(pem, "private.pem");
+        let findings = scan_text_unredacted(pem, "private.pem");
         let finding = findings
             .iter()
-            .find(|f| f.detector == "private_key_pem")
+            .find(|f| f.safe().detector == "private_key_pem")
             .expect("PEM finding");
-        assert_eq!(finding.raw_match, pem);
-        let context = finding.context.as_ref().expect("bounded PEM context");
+        assert_eq!(finding.raw_secret(), pem);
+        let context = finding
+            .safe()
+            .context
+            .as_ref()
+            .expect("bounded PEM context");
         assert!(!context.contains("MIIEpAIBAAKCAQEA7SyntheticPrivateKeyBodyLineOne"));
         assert!(!context.contains("SyntheticPrivateKeyBodyLineTwo9xYz"));
         assert!(!context.contains("-----BEGIN RSA PRIVATE KEY-----"));
@@ -1162,9 +1237,9 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
     fn unicode_prefix_keeps_absolute_spans_on_character_boundaries() {
         let github = "ghp_FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
         let text = format!("προοίμιο\ntoken={github}\nτέλος");
-        let findings = scan_text(&text, "unicode");
-        assert_eq!(findings[0].raw_match, github);
-        let context = findings[0].context.as_ref().expect("safe context");
+        let findings = scan_text_unredacted(&text, "unicode");
+        assert_eq!(findings[0].raw_secret(), github);
+        let context = findings[0].safe().context.as_ref().expect("safe context");
         assert!(!context.contains(github));
         assert!(context.contains("προοίμιο"));
         assert!(context.contains("τέλος"));
@@ -1186,5 +1261,32 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
     fn span_normalization_merges_overlapping_and_adjacent_ranges() {
         let merged = merge_spans([8..12, 2..6, 5..9, 12..15, 20..21]);
         assert_eq!(merged, vec![2..15, 20..21]);
+    }
+
+    #[test]
+    fn default_finding_serialization_and_debug_hold_no_raw_secret() {
+        let secret = "ghp_HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH";
+        let finding = scan_text(secret, "safe-model")
+            .into_iter()
+            .find(|finding| finding.detector == "github_pat")
+            .expect("GitHub finding");
+        let json = serde_json::to_string(&finding).unwrap();
+        let debug = format!("{finding:?}");
+        assert!(!json.contains(secret));
+        assert!(!debug.contains(secret));
+        assert!(!json.contains("raw_match"));
+        assert!(json.contains("fingerprint"));
+        assert!(json.contains("redacted"));
+    }
+
+    #[test]
+    fn unsafe_finding_debug_still_hides_raw_secret() {
+        let secret = "ghp_IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII";
+        let finding = scan_text_unredacted(secret, "unsafe-debug")
+            .into_iter()
+            .find(|finding| finding.safe().detector == "github_pat")
+            .expect("GitHub finding");
+        assert_eq!(finding.raw_secret(), secret);
+        assert!(!format!("{finding:?}").contains(secret));
     }
 }

@@ -17,10 +17,10 @@ boundaries it crosses: the local filesystem (via the `ignore` crate),
 
 `main` reads as a sequential pipeline: tracing init (default `warn`)
 → clap `Cli::parse` → dispatch to one of three async runners → each
-calls `emit(source, findings, OutputArgs)` to filter, group, and
-format → exit 0/2 by `any_high` aggregation. `OutputArgs` is
-`#[command(flatten)]`-ed onto every subcommand so the surface is
-identical across `local`, `github`, and `slack`.
+calls the safe `emit` path to filter, group, and format → exit 0/2 by
+`any_high` aggregation. Explicit local `--unredacted` dispatches through
+`scan_directory_unredacted` and `emit_unredacted`; GitHub and Slack reject that
+flag before source access, and clap rejects its use with SARIF.
 
 ```mermaid
 sequenceDiagram
@@ -32,39 +32,52 @@ sequenceDiagram
     participant Src as sources::mod::scan_*
     participant Emit as emit
     participant Sev as Severity::from_min + filter_by_min_severity
-    participant Rep as Report::from_findings
+    participant Rep as Report / UnsafeReport
     participant Out as write_human / write_json / write_sarif
 
     Op->>Main: clavenar-shadow-scanner subcommand [...]
     Main->>Main: tracing_subscriber::registry + EnvFilter (default warn, stderr writer)
     Main->>Cli: parse argv + env
     Cli-->>Main: Cli { command, OutputArgs { json, sarif, unredacted, severity_min } }
-    alt Command::Local
+    break Command::Local with --unredacted
+        Main->>Run: run_local(path, out)
+        Run->>Src: sources::local::scan_directory_unredacted(path)
+        Src-->>Run: VecUnsafeFinding (raw retained deliberately)
+        Run->>Emit: emit_unredacted(source, findings, out)
+        Emit->>Rep: UnsafeReport::from_findings
+        Note over Emit,Rep: human banner; JSON unsafe_output=true + warning; no SARIF writer
+        Rep-->>Emit: UnsafeReport carrying mandatory warning
+        Emit->>Out: write unsafe human or JSON
+        Out-->>Op: visibly marked secret-bearing payload
+    end
+    alt Command::Local safe default
         Main->>Run: run_local(path, out)
         Run->>Src: sources::local::scan_directory(path)
     else Command::Github
         Main->>Run: run_github(owner_arg, include_forks, include_archived, out)
+        Run->>Run: reject --unredacted before client/source access
         Run->>Run: split owner/repo on first '/'
         Run->>Src: sources::github::scan_owner(client, owner, repo_filter, include_forks, include_archived)
     else Command::Slack
         Main->>Run: run_slack(days, out)
+        Run->>Run: reject --unredacted before token/source access
         Run->>Src: sources::slack::scan_workspace(client, lookback_days)
     end
-    Src-->>Run: VecFinding (raw, possibly multi-detector per line)
+    Src-->>Run: VecFinding (fingerprint + redacted value; no raw field)
     Run->>Emit: emit(source_label, findings, out)
     Emit->>Sev: Severity::from_min(out.severity_min) — error if invalid
     Sev->>Emit: Severity enum
     Emit->>Sev: filter_by_min_severity(findings, min)
     Sev-->>Emit: filtered VecFinding
-    Emit->>Rep: from_findings(source, filtered, unredacted && !sarif)
-    Note over Emit: SARIF always overrides --unredacted — SARIF outputs end up as CI artefacts
+    Emit->>Rep: Report::from_findings(source, filtered)
+    Note over Emit,Rep: safe Finding, Aggregate, and Report models contain no recoverable raw value
     Rep-->>Emit: Report { source, scanned_at, aggregates, total_findings }
     alt out.sarif
         Emit->>Out: report.write_sarif(stdout)
     else out.json
         Emit->>Out: report.write_json(stdout)
     else
-        Emit->>Out: report.write_human(stdout, unredacted)
+        Emit->>Out: report.write_human(stdout)
     end
     Out-->>Op: stdout payload
     Emit->>Emit: any_high = aggregates.iter().any(Critical or High)
@@ -296,12 +309,13 @@ under 4 KiB (pathological-regex guard), every detector's regex runs;
 matches that clear `min_length` and `min_entropy` (Shannon, bits per
 byte) are first recorded as absolute byte spans. Bounded PEM matches
 expand through their matching footer. After the complete input has been
-scanned, overlapping and adjacent spans are merged and every `Finding`
+scanned, overlapping and adjacent spans are merged and every safe `Finding`
 gets a ±2-line context window rendered from that complete redaction set.
 If the window includes an unscanned oversized line, or a PEM block is
 unterminated, context is omitted rather than rendered unsafely.
-`Report::from_findings` then groups by SHA-256 fingerprint of the
-raw secret (so the same key in 12 files becomes one entry with 12
+The default path computes the fingerprint and redacted display value while the
+match is in scope, then drops matched plaintext before returning. `Report` then
+groups by that fingerprint (so the same key in 12 files becomes one entry with 12
 locations), dedupes inside an aggregate by `(location, line)` to
 collapse the vendor-vs-generic-backstop overlap, and keeps the
 highest-severity detector name on conflict.
@@ -316,7 +330,7 @@ sequenceDiagram
     participant Span as merge_spans
     participant Ctx as build_context
     participant Rep as Report::from_findings
-    participant FP as Finding::fingerprint (sha256[..8])
+    participant FP as fingerprint + redact while raw span is in scope
 
     Caller->>Scan: scan_text(text, location)
     loop every line (idx, line)
@@ -351,15 +365,15 @@ sequenceDiagram
         else safe rendering cannot be proven
             Scan->>Scan: context = None
         end
-        Scan->>Scan: out.push Finding { detector, severity, location, line: idx+1, raw_match, context }
+        Scan->>FP: sha256(raw span)[..8] + redact(raw span)
+        FP-->>Scan: fingerprint + redacted display value
+        Scan->>Scan: out.push Finding { detector, severity, location, line, fingerprint, redacted, context }
     end
-    Scan-->>Caller: VecFinding
+    Scan-->>Caller: VecFinding — no recoverable raw field
 
-    Caller->>Rep: Report::from_findings(source, findings, unredacted)
+    Caller->>Rep: Report::from_findings(source, findings)
     loop every finding
-        Rep->>FP: f.fingerprint — sha256(raw_match)[..8] hex
-        FP-->>Rep: fingerprint string
-        Rep->>Rep: BTreeMap entry-or-insert Aggregate { fingerprint, detector, severity, redacted(raw), raw: Some(raw) if unredacted, locations: [] }
+        Rep->>Rep: BTreeMap entry-or-insert Aggregate { fingerprint, detector, severity, redacted, locations: [] }
         alt f.severity < entry.severity
             Rep->>Rep: entry.severity = f.severity — entry.detector = f.detector — higher tier wins
         end
@@ -386,9 +400,9 @@ flowchart TD
     Tracing --> Parse[clap Cli parse + OutputArgs flatten]
     Parse --> Sub{subcommand}
 
-    Sub -->|local path| L[sources::local::scan_directory<br/>spawn_blocking ignore::WalkBuilder<br/>per-file size + binary + utf8 gates]
-    Sub -->|github owner or owner/repo| G[sources::github::scan_owner<br/>GITHUB_TOKEN optional, 60 rph fallback<br/>orgs then users endpoint fallback<br/>rate-limit + 429 retry loop]
-    Sub -->|slack --days N| S[sources::slack::scan_workspace<br/>SLACK_BOT_TOKEN required else bail<br/>cursored list_conversations + fetch_history<br/>skip archived + non-member]
+    Sub -->|local path| L[safe scan_directory by default<br/>explicit unsafe local path only<br/>per-file size + binary + utf8 gates]
+    Sub -->|github owner or owner/repo| G[reject --unredacted before access<br/>GITHUB_TOKEN optional, 60 rph fallback<br/>orgs then users endpoint fallback<br/>rate-limit + 429 retry loop]
+    Sub -->|slack --days N| S[reject --unredacted before access<br/>SLACK_BOT_TOKEN required else bail<br/>cursored list_conversations + fetch_history<br/>skip archived + non-member]
 
     L --> Det[scan_text per file<br/>line under 4 KiB<br/>collect every accepted byte span<br/>expand bounded PEM blocks<br/>merge overlap + adjacency<br/>render context from complete redaction set]
     G --> Det
@@ -398,12 +412,12 @@ flowchart TD
     Emit --> SevMin{Severity::from_min<br/>valid?}
     SevMin -->|no| Err1[exit 1 — anyhow context]
     SevMin -->|yes| Filter[filter_by_min_severity]
-    Filter --> Build[Report::from_findings<br/>BTreeMap fingerprint dedupe<br/>location, line collapse<br/>higher-severity detector wins]
+    Filter --> Build[safe Report::from_findings<br/>no recoverable raw field<br/>BTreeMap fingerprint dedupe<br/>location, line collapse]
 
     Build --> Fmt{output format}
-    Fmt -->|--sarif| Sarif[write_sarif<br/>always redacted, ignores --unredacted<br/>fingerprint as clavenar/v1 stable id]
-    Fmt -->|--json| Json[write_json<br/>raw field present only if unredacted]
-    Fmt -->|default| Human[write_human<br/>banner if unredacted<br/>cap locations at 5, suggest --json]
+    Fmt -->|--sarif| Sarif[write_sarif<br/>safe model only<br/>fingerprint as clavenar/v1 stable id]
+    Fmt -->|--json| Json[write_json<br/>safe model has no raw field]
+    Fmt -->|default| Human[write_human<br/>redacted display only<br/>cap locations at 5, suggest --json]
 
     Sarif --> AnyHigh{any aggregate<br/>Critical or High?}
     Json --> AnyHigh

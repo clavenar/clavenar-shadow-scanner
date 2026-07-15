@@ -20,4 +20,7 @@ pub mod detector;
 pub mod output;
 pub mod sources;
 
-pub use detector::{Detector, Finding, Severity, detectors, redact, scan_text, shannon_entropy};
+pub use detector::{
+    Detector, Finding, Severity, UnsafeFinding, detectors, redact, scan_text, scan_text_unredacted,
+    shannon_entropy,
+};

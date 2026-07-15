@@ -1,18 +1,15 @@
 //! Output formatters and finding aggregation.
 //!
-//! [`Report`] groups raw [`Finding`]s by the SHA-256 fingerprint of the
-//! secret so a key leaked in 12 files becomes one entry with 12
-//! locations. The CLI exposes three modes: human, JSON, and SARIF (the
-//! last lives in the [`sarif`] submodule).
+//! [`Report`] groups safe [`Finding`]s by fingerprint so a key leaked in
+//! 12 files becomes one entry with 12 locations. Its data model contains no
+//! recoverable raw value. Explicit local unsafe output uses the separate
+//! [`UnsafeReport`] type.
 //!
-//! Redaction is on by default. The `unredacted` flag flips secrets back
-//! to plaintext at the user's explicit request — the human formatter
-//! prints a banner reminding them they're producing a secrets file.
-//! SARIF ignores `unredacted` entirely; see [`sarif`].
+//! SARIF accepts only [`Report`]; see [`sarif`].
 
 mod sarif;
 
-use crate::detector::{Finding, Severity, redact};
+use crate::detector::{Finding, Severity, UnsafeFinding};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -24,11 +21,6 @@ pub struct Aggregate {
     pub detector: String,
     pub severity: Severity,
     pub redacted: String,
-    /// Present only when `unredacted=true` was passed to `from_findings`.
-    /// Skipped from JSON when None so default output never serializes
-    /// the secret.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw: Option<String>,
     pub locations: Vec<Location>,
 }
 
@@ -49,28 +41,18 @@ pub struct Report {
 
 impl Report {
     /// Group `findings` by fingerprint and produce a `Report`.
-    /// `unredacted` includes the raw secret in each aggregate when true.
-    pub fn from_findings(
-        source: impl Into<String>,
-        findings: Vec<Finding>,
-        unredacted: bool,
-    ) -> Self {
+    pub fn from_findings(source: impl Into<String>, findings: Vec<Finding>) -> Self {
         let total_findings = findings.len();
         // BTreeMap so output ordering is stable across runs (helpful for
         // diffs in CI).
         let mut buckets: BTreeMap<String, Aggregate> = BTreeMap::new();
         for f in findings {
-            let fp = f.fingerprint();
+            let fp = f.fingerprint.clone();
             let entry = buckets.entry(fp.clone()).or_insert_with(|| Aggregate {
                 fingerprint: fp.clone(),
                 detector: f.detector.clone(),
                 severity: f.severity,
-                redacted: redact(&f.raw_match),
-                raw: if unredacted {
-                    Some(f.raw_match.clone())
-                } else {
-                    None
-                },
+                redacted: f.redacted.clone(),
                 locations: Vec::new(),
             });
             // If multiple detectors fire on the same secret, prefer the
@@ -118,20 +100,12 @@ impl Report {
         writeln!(w, "{}", s)
     }
 
-    /// Write the report as SARIF v2.1.0. Always redacted regardless of
-    /// the `unredacted` flag the report was built with — see [`sarif`].
+    /// Write the report as SARIF v2.1.0. The accepted model has no raw value.
     pub fn write_sarif(&self, w: impl Write) -> std::io::Result<()> {
         sarif::write(self, w)
     }
 
-    pub fn write_human(&self, mut w: impl Write, unredacted: bool) -> std::io::Result<()> {
-        if unredacted {
-            writeln!(
-                w,
-                "!! UNREDACTED OUTPUT — this report contains live secrets. Treat it as such."
-            )?;
-            writeln!(w)?;
-        }
+    pub fn write_human(&self, mut w: impl Write) -> std::io::Result<()> {
         writeln!(
             w,
             "clavenar-shadow-scanner :: source={}  scanned_at={}",
@@ -152,10 +126,6 @@ impl Report {
         }
 
         for agg in &self.aggregates {
-            let value = match &agg.raw {
-                Some(raw) if unredacted => raw.clone(),
-                _ => agg.redacted.clone(),
-            };
             writeln!(
                 w,
                 "[{}] {}  fp={}",
@@ -163,7 +133,7 @@ impl Report {
                 agg.detector,
                 agg.fingerprint
             )?;
-            writeln!(w, "  secret: {}", value)?;
+            writeln!(w, "  secret: {}", agg.redacted)?;
             writeln!(w, "  found in {} location(s):", agg.locations.len())?;
             // Cap inline location output at 5 to keep the human report
             // readable; full locations live in the JSON.
@@ -193,6 +163,133 @@ impl Report {
     }
 }
 
+pub const UNSAFE_OUTPUT_WARNING: &str =
+    "UNREDACTED OUTPUT — this report contains live secrets. Treat it as such.";
+
+/// Secret-bearing aggregate used only by explicit local unsafe output.
+#[derive(Serialize)]
+pub struct UnsafeAggregate {
+    pub fingerprint: String,
+    pub detector: String,
+    pub severity: Severity,
+    pub redacted: String,
+    pub raw: String,
+    pub locations: Vec<Location>,
+}
+
+/// Explicitly secret-bearing report. It cannot be constructed from safe
+/// findings, has no SARIF writer, and every serialization carries a warning.
+#[derive(Serialize)]
+pub struct UnsafeReport {
+    pub unsafe_output: bool,
+    pub warning: &'static str,
+    pub source: String,
+    pub scanned_at: chrono::DateTime<chrono::Utc>,
+    pub aggregates: Vec<UnsafeAggregate>,
+    pub total_findings: usize,
+}
+
+impl UnsafeReport {
+    pub fn from_findings(source: impl Into<String>, findings: Vec<UnsafeFinding>) -> Self {
+        let mut raw_by_fingerprint = BTreeMap::new();
+        let safe_findings = findings
+            .into_iter()
+            .map(|finding| {
+                let (safe, raw) = finding.into_parts();
+                raw_by_fingerprint
+                    .entry(safe.fingerprint.clone())
+                    .or_insert(raw);
+                safe
+            })
+            .collect();
+        let report = Report::from_findings(source, safe_findings);
+        let aggregates = report
+            .aggregates
+            .into_iter()
+            .map(|aggregate| UnsafeAggregate {
+                raw: raw_by_fingerprint
+                    .remove(&aggregate.fingerprint)
+                    .expect("unsafe finding has matching raw value"),
+                fingerprint: aggregate.fingerprint,
+                detector: aggregate.detector,
+                severity: aggregate.severity,
+                redacted: aggregate.redacted,
+                locations: aggregate.locations,
+            })
+            .collect();
+        Self {
+            unsafe_output: true,
+            warning: UNSAFE_OUTPUT_WARNING,
+            source: report.source,
+            scanned_at: report.scanned_at,
+            aggregates,
+            total_findings: report.total_findings,
+        }
+    }
+
+    pub fn write_json(&self, mut w: impl Write) -> std::io::Result<()> {
+        let serialized =
+            serde_json::to_string_pretty(self).expect("UnsafeReport always serializes");
+        writeln!(w, "{serialized}")
+    }
+
+    pub fn write_human(&self, mut w: impl Write) -> std::io::Result<()> {
+        writeln!(w, "!! {UNSAFE_OUTPUT_WARNING}")?;
+        writeln!(w)?;
+        writeln!(
+            w,
+            "clavenar-shadow-scanner :: source={}  scanned_at={}",
+            self.source,
+            self.scanned_at.to_rfc3339()
+        )?;
+        writeln!(
+            w,
+            "{} unique secret(s) across {} finding(s)",
+            self.aggregates.len(),
+            self.total_findings
+        )?;
+        writeln!(w)?;
+
+        if self.aggregates.is_empty() {
+            writeln!(w, "  no findings.")?;
+            return Ok(());
+        }
+
+        for aggregate in &self.aggregates {
+            writeln!(
+                w,
+                "[{}] {}  fp={}",
+                aggregate.severity.as_str().to_uppercase(),
+                aggregate.detector,
+                aggregate.fingerprint
+            )?;
+            writeln!(w, "  secret: {}", aggregate.raw)?;
+            writeln!(w, "  found in {} location(s):", aggregate.locations.len())?;
+            let cap = 5;
+            for location in aggregate.locations.iter().take(cap) {
+                writeln!(w, "    - {}:{}", location.location, location.line)?;
+            }
+            if aggregate.locations.len() > cap {
+                writeln!(
+                    w,
+                    "    … {} more (use --json for full list)",
+                    aggregate.locations.len() - cap
+                )?;
+            }
+            if let Some(first) = aggregate.locations.first()
+                && let Some(context) = &first.context
+            {
+                writeln!(w, "  context (first hit):")?;
+                for line in context.lines() {
+                    writeln!(w, "    {line}")?;
+                }
+            }
+            writeln!(w)?;
+        }
+        Ok(())
+    }
+}
+
 /// Filter findings by minimum severity. `Severity::Critical` is the
 /// most-severe and orders smallest under our `Ord` impl, so "≥ severity"
 /// means "ord <= chosen" in our enum direction.
@@ -200,20 +297,23 @@ pub fn filter_by_min_severity(findings: Vec<Finding>, min: Severity) -> Vec<Find
     findings.into_iter().filter(|f| f.severity <= min).collect()
 }
 
+pub fn filter_unsafe_by_min_severity(
+    findings: Vec<UnsafeFinding>,
+    min: Severity,
+) -> Vec<UnsafeFinding> {
+    findings
+        .into_iter()
+        .filter(|finding| finding.safe().severity <= min)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::detector::Severity;
+    use crate::detector::{Severity, scan_text_unredacted};
 
     fn finding(detector: &str, sev: Severity, raw: &str, loc: &str, line: u32) -> Finding {
-        Finding {
-            detector: detector.into(),
-            severity: sev,
-            location: loc.into(),
-            line,
-            raw_match: raw.into(),
-            context: None,
-        }
+        Finding::from_match(detector.into(), sev, loc.into(), line, raw, None)
     }
 
     #[test]
@@ -221,7 +321,7 @@ mod tests {
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
         let f1 = finding("anthropic_api_key", Severity::Critical, key, "a/.env", 1);
         let f2 = finding("anthropic_api_key", Severity::Critical, key, "b/.env", 7);
-        let r = Report::from_findings("test", vec![f1, f2], false);
+        let r = Report::from_findings("test", vec![f1, f2]);
         assert_eq!(r.aggregates.len(), 1);
         assert_eq!(r.aggregates[0].locations.len(), 2);
         assert_eq!(r.total_findings, 2);
@@ -239,7 +339,6 @@ mod tests {
                 "a",
                 1,
             )],
-            false,
         );
         let mut buf = Vec::new();
         r.write_json(&mut buf).unwrap();
@@ -249,30 +348,22 @@ mod tests {
     }
 
     #[test]
-    fn json_output_includes_raw_when_unredacted() {
+    fn unsafe_json_output_includes_raw_and_warning() {
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
-        let r = Report::from_findings(
-            "test",
-            vec![finding(
-                "anthropic_api_key",
-                Severity::Critical,
-                key,
-                "a",
-                1,
-            )],
-            true,
-        );
+        let r = UnsafeReport::from_findings("test", scan_text_unredacted(key, "a"));
         let mut buf = Vec::new();
         r.write_json(&mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains(key));
+        assert!(s.contains("\"unsafe_output\": true"));
+        assert!(s.contains(UNSAFE_OUTPUT_WARNING));
     }
 
     #[test]
-    fn human_output_with_unredacted_includes_warning_banner() {
-        let r = Report::from_findings("test", vec![], true);
+    fn unsafe_human_output_includes_warning_banner() {
+        let r = UnsafeReport::from_findings("test", vec![]);
         let mut buf = Vec::new();
-        r.write_human(&mut buf, true).unwrap();
+        r.write_human(&mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("UNREDACTED"));
     }
@@ -306,7 +397,7 @@ mod tests {
             "a/.env",
             1,
         );
-        let r = Report::from_findings("test", vec![f_vendor, f_generic], false);
+        let r = Report::from_findings("test", vec![f_vendor, f_generic]);
         assert_eq!(r.aggregates.len(), 1, "fingerprint dedupe broken");
         assert_eq!(
             r.aggregates[0].locations.len(),
@@ -330,7 +421,6 @@ mod tests {
                 finding("openai_api_key", Severity::Critical, key, "a/.env", 1),
                 finding("openai_api_key", Severity::Critical, key, "a/.env", 5),
             ],
-            false,
         );
         assert_eq!(r.aggregates.len(), 1);
         assert_eq!(r.aggregates[0].locations.len(), 2);
@@ -345,7 +435,6 @@ mod tests {
                 finding("anthropic", Severity::Critical, "sk-ant-api03-AAA", "b", 1),
                 finding("github_pat", Severity::Critical, "ghp_AAA", "c", 1),
             ],
-            false,
         );
         // Critical entries lead, low last.
         assert_eq!(agg.aggregates[0].severity, Severity::Critical);

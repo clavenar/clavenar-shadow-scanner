@@ -26,9 +26,18 @@ release candidate.
 ## Explicit unredacted output
 
 1. Run human and JSON output with `--unredacted` against the synthetic fixture.
-2. Confirm the warning banner is present in human output and JSON has a `raw`
-   field. Treat both outputs as secret-bearing data and delete them immediately.
-3. Run `--sarif --unredacted` and confirm SARIF remains redacted.
+2. Confirm the warning banner is present in human output and JSON has `raw`,
+   `"unsafe_output": true`, and a prominent warning. Treat both outputs as
+   secret-bearing data and delete them immediately.
+3. Confirm `github ... --unredacted` and `slack --unredacted` fail before source
+   access, and `--sarif --unredacted` is rejected as a CLI conflict.
+
+## Safe data model
+
+1. Run the safe-model unit and integration suite and confirm direct `Finding`
+   serialization plus safe/unsafe debug output contains no complete credential.
+2. Confirm default JSON has no `raw` member and still carries `fingerprint` and
+   `redacted` fields.
 
 ## Static release artifact
 

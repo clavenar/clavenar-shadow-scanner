@@ -9,15 +9,22 @@ matched secret must clear. When the regex has a capture group, group 1
 is the secret; otherwise the whole match is. `scan_text` runs every
 detector against every line under 4 KiB and yields a `Finding` per hit.
 
+The default `Finding` is safe by construction: it contains detector metadata,
+location and line, a stable fingerprint, a redacted display value, and safe
+context, but no recoverable raw credential. The default `Report` accepts only
+that type. Explicit local `--unredacted` scans use separate `UnsafeFinding` and
+`UnsafeReport` types; their debug representation stays redacted, unsafe JSON is
+prominently marked, remote sources reject the flag before access, and SARIF has
+no unsafe writer.
+
 Detection and context rendering are separate passes. `scan_text` first
 records the exact absolute byte span of every accepted match, expands a
 bounded PEM private key through its matching footer, sorts the spans, and
 merges overlapping or adjacent ranges. Only then does it render each
 ±2-line context window, redacting every merged span that intersects the
 window. Context is omitted if the window includes an unscanned line over
-4 KiB or if a multi-line PEM block is unterminated. Explicit local
-`--unredacted` output still exposes the aggregate raw match by request;
-human, JSON, and SARIF defaults use only redacted aggregates and contexts.
+4 KiB or if a multi-line PEM block is unterminated. Human, JSON, and SARIF
+defaults use only the raw-free safe model.
 
 Severity is load-bearing. The CLI's `emit` (in
 [`src/main.rs`](../src/main.rs)) exits `2` when any surviving aggregate
@@ -116,10 +123,10 @@ keeps short deterministic identifiers from tripping the catch-all rule.
 
 `write_sarif` in [`src/output/sarif.rs`](../src/output/sarif.rs) emits a
 SARIF v2.1.0 document — the schema GitHub Code Scanning, Sonatype, and
-Snyk consume. It is **always redacted**, regardless of `--unredacted`,
-because SARIF artefacts land in CI logs and PR annotations; `emit` in
-[`src/main.rs`](../src/main.rs) enforces this by building the `Report`
-with `unredacted && !sarif`.
+Snyk consume. It is **always redacted** because it accepts only the safe
+`Report` type, which contains no recoverable raw value. Clap rejects
+`--sarif --unredacted`, and remote sources reject `--unredacted` before
+source access.
 
 - **Envelope.** `$schema` points at `sarif-2.1.0.json`, `version` is
   `"2.1.0"`, and there is a single `runs[0]` whose `tool.driver.name` is

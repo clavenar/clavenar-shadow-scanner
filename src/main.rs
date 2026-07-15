@@ -4,11 +4,11 @@
 //! flags are split out into [`OutputArgs`] so each subcommand sees the
 //! same surface.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use clavenar_shadow_scanner::{
     detector::Severity,
-    output::{Report, filter_by_min_severity},
+    output::{Report, UnsafeReport, filter_by_min_severity, filter_unsafe_by_min_severity},
     sources,
 };
 use std::io::stdout;
@@ -68,10 +68,9 @@ struct OutputArgs {
     /// artefacts and we never teach this path to leak.
     #[arg(long, conflicts_with = "json")]
     sarif: bool,
-    /// Show secrets in plaintext. **Default is redacted.** This makes
-    /// the output a secrets file — handle accordingly. Ignored when
-    /// `--sarif` is set (SARIF output is always redacted).
-    #[arg(long)]
+    /// Show secrets in plaintext for a local scan. This makes the output a
+    /// secrets file. Rejected for remote sources and SARIF.
+    #[arg(long, conflicts_with = "sarif")]
     unredacted: bool,
     /// Drop findings below this severity. One of: critical, high,
     /// medium, low.
@@ -101,8 +100,14 @@ async fn main() -> Result<()> {
 }
 
 async fn run_local(path: PathBuf, out: OutputArgs) -> Result<()> {
-    let findings = sources::local::scan_directory(&path).await?;
-    emit(&format!("local:{}", path.display()), findings, out)
+    let source = format!("local:{}", path.display());
+    if out.unredacted {
+        let findings = sources::local::scan_directory_unredacted(&path).await?;
+        emit_unredacted(&source, findings, out)
+    } else {
+        let findings = sources::local::scan_directory(&path).await?;
+        emit(&source, findings, out)
+    }
 }
 
 async fn run_github(
@@ -111,6 +116,7 @@ async fn run_github(
     include_archived: bool,
     out: OutputArgs,
 ) -> Result<()> {
+    reject_remote_unredacted(&out, "github")?;
     let client = sources::github::GitHubClient::from_env();
     let (owner, repo) = match owner_arg.split_once('/') {
         Some((o, r)) => (o.to_string(), Some(r.to_string())),
@@ -129,6 +135,7 @@ async fn run_github(
 }
 
 async fn run_slack(days: i64, out: OutputArgs) -> Result<()> {
+    reject_remote_unredacted(&out, "slack")?;
     let client = sources::slack::SlackClient::from_env()?;
     let findings = sources::slack::scan_workspace(&client, days).await?;
     emit(&format!("slack://workspace?days={}", days), findings, out)
@@ -142,17 +149,14 @@ fn emit(
     let min = Severity::from_min(&out.severity_min)
         .with_context(|| format!("invalid --severity-min: {}", out.severity_min))?;
     let findings = filter_by_min_severity(findings, min);
-    // SARIF output is always redacted (these files routinely end up as
-    // CI artefacts / PR annotations). For json + human, the unredacted
-    // flag rides through unchanged.
-    let report = Report::from_findings(source, findings, out.unredacted && !out.sarif);
+    let report = Report::from_findings(source, findings);
     let mut stdout = stdout().lock();
     if out.sarif {
         report.write_sarif(&mut stdout)?;
     } else if out.json {
         report.write_json(&mut stdout)?;
     } else {
-        report.write_human(&mut stdout, out.unredacted)?;
+        report.write_human(&mut stdout)?;
     }
     // Non-zero exit if any critical/high finding so CI integration is
     // useful. Medium and low are informational.
@@ -162,6 +166,41 @@ fn emit(
         .any(|a| matches!(a.severity, Severity::Critical | Severity::High));
     if any_high {
         std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn emit_unredacted(
+    source: &str,
+    findings: Vec<clavenar_shadow_scanner::UnsafeFinding>,
+    out: OutputArgs,
+) -> Result<()> {
+    if out.sarif {
+        bail!("--unredacted cannot be combined with --sarif");
+    }
+    let min = Severity::from_min(&out.severity_min)
+        .with_context(|| format!("invalid --severity-min: {}", out.severity_min))?;
+    let findings = filter_unsafe_by_min_severity(findings, min);
+    let report = UnsafeReport::from_findings(source, findings);
+    let mut stdout = stdout().lock();
+    if out.json {
+        report.write_json(&mut stdout)?;
+    } else {
+        report.write_human(&mut stdout)?;
+    }
+    let any_high = report
+        .aggregates
+        .iter()
+        .any(|aggregate| matches!(aggregate.severity, Severity::Critical | Severity::High));
+    if any_high {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn reject_remote_unredacted(out: &OutputArgs, source: &str) -> Result<()> {
+    if out.unredacted {
+        bail!("--unredacted is restricted to local scans; {source} output is always redacted");
     }
     Ok(())
 }

@@ -17,8 +17,12 @@ fn every_default_serializer_redacts_the_complete_multi_secret_corpus() {
     assert!(findings.len() >= 4, "expected the complete detector corpus");
 
     for finding in &findings {
-        if let Some(context) = &finding.context {
-            for secret in [anthropic, github, openai, pem_body_one, pem_body_two] {
+        let serialized = serde_json::to_string(finding).unwrap();
+        let debug = format!("{finding:?}");
+        for secret in [anthropic, github, openai, pem_body_one, pem_body_two] {
+            assert!(!serialized.contains(secret));
+            assert!(!debug.contains(secret));
+            if let Some(context) = &finding.context {
                 assert!(
                     !context.contains(secret),
                     "complete credential appeared in finding context"
@@ -27,9 +31,9 @@ fn every_default_serializer_redacts_the_complete_multi_secret_corpus() {
         }
     }
 
-    let report = Report::from_findings("synthetic-corpus", findings, false);
+    let report = Report::from_findings("synthetic-corpus", findings);
     let mut human = Vec::new();
-    report.write_human(&mut human, false).unwrap();
+    report.write_human(&mut human).unwrap();
     let mut json = Vec::new();
     report.write_json(&mut json).unwrap();
     let mut sarif = Vec::new();

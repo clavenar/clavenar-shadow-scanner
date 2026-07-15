@@ -118,14 +118,7 @@ mod tests {
     use crate::detector::{Finding, Severity};
 
     fn finding(detector: &str, sev: Severity, raw: &str, loc: &str, line: u32) -> Finding {
-        Finding {
-            detector: detector.into(),
-            severity: sev,
-            location: loc.into(),
-            line,
-            raw_match: raw.into(),
-            context: None,
-        }
+        Finding::from_match(detector.into(), sev, loc.into(), line, raw, None)
     }
 
     #[test]
@@ -140,7 +133,6 @@ mod tests {
                 "a/.env",
                 7,
             )],
-            false,
         );
         let mut buf = Vec::new();
         r.write_sarif(&mut buf).unwrap();
@@ -159,8 +151,8 @@ mod tests {
 
     #[test]
     fn sarif_output_never_includes_raw_secret() {
-        // Even when the report was built with `unredacted=true`,
-        // write_sarif must redact — SARIF artefacts end up in CI logs.
+        // Report has no raw field, so the SARIF writer cannot recover the
+        // matched value even if called independently of the CLI.
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
         let r = Report::from_findings(
             "test",
@@ -171,7 +163,6 @@ mod tests {
                 "a/.env",
                 7,
             )],
-            true,
         );
         let mut buf = Vec::new();
         r.write_sarif(&mut buf).unwrap();
@@ -196,7 +187,6 @@ mod tests {
                 finding("anthropic_api_key", Severity::Critical, key, "a/.env", 7),
                 finding("anthropic_api_key", Severity::Critical, key, "b/.env", 12),
             ],
-            false,
         );
         let mut buf = Vec::new();
         r.write_sarif(&mut buf).unwrap();
@@ -228,7 +218,6 @@ mod tests {
                 finding("anthropic", Severity::Critical, "sk-ant-api03-BBB", "b", 1),
                 finding("github_pat", Severity::Critical, "ghp_AAA", "c", 1),
             ],
-            false,
         );
         let mut buf = Vec::new();
         r.write_sarif(&mut buf).unwrap();
@@ -242,7 +231,7 @@ mod tests {
 
     #[test]
     fn sarif_empty_report_still_valid() {
-        let r = Report::from_findings("test", vec![], false);
+        let r = Report::from_findings("test", vec![]);
         let mut buf = Vec::new();
         r.write_sarif(&mut buf).unwrap();
         let v: serde_json::Value =

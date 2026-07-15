@@ -34,7 +34,7 @@ No account, no sign-up — grab the static binary and run.
 runtime deps, no installer):
 
 ```bash
-V=0.1.1
+V=0.1.2
 curl -fsSL "https://github.com/clavenar/clavenar-shadow-scanner/releases/download/v${V}/clavenar-shadow-scanner-${V}-x86_64-linux-musl.tar.gz" \
   | tar -xz
 ./clavenar-shadow-scanner local ~
@@ -68,12 +68,13 @@ SLACK_BOT_TOKEN=xoxb-… clavenar-shadow-scanner slack
 ```
 
 Output is **redacted by default** — secrets render as `<first4>…<last4>`.
-Pass `--unredacted` if you actually need the raw key in the report
-(e.g. for triage). The human-readable report leads with a banner
-warning the file is now a secrets file. JSON output via `--json`,
+Default findings and reports contain no recoverable raw-secret field.
+For a local scan only, pass `--unredacted` if you actually need the raw key
+for triage. Human output leads with a warning banner and JSON carries
+`"unsafe_output": true` plus a warning. GitHub and Slack reject the flag
+before source access, and it conflicts with SARIF. JSON output via `--json`,
 SARIF v2.1.0 via `--sarif` (consumed by GitHub Code Scanning, Sonatype,
-Snyk, and most modern code-review tools — always redacted regardless
-of `--unredacted`).
+Snyk, and most modern code-review tools — structurally redacted).
 
 ## Subcommands
 
@@ -85,14 +86,14 @@ github <owner>[/<repo>] [...]     Scan one repo or every repo under an owner.
 slack [--days N]                  Scan recent Slack history (default 14d).
 ```
 
-Common output flags (every subcommand):
+Output flags (`--unredacted` is local-only; the others are common):
 
 ```
 --json                            Machine-readable JSON. Mutually exclusive with --sarif.
 --sarif                           SARIF v2.1.0 (always redacted; ready for GitHub
                                   Code Scanning's `upload-sarif` action and friends).
---unredacted                      Show secrets in plaintext in JSON / human output
-                                  (default: redact). Ignored under --sarif.
+--unredacted                      Local scans only: show secrets in visibly marked
+                                  JSON / human output. Rejected remotely and with SARIF.
 --severity-min critical|high|medium|low
                                   Drop findings below this severity (default: low).
 ```
@@ -132,9 +133,14 @@ auto-resolve once the secret is removed.
 The scanner finds secrets, so the report itself can become a secrets
 file:
 
-- **Default**: secrets render as `<first4>…<last4>`. The JSON has no
-  `raw` field. The human report has no banner.
-- **`--unredacted`**: secrets render in full. JSON includes `raw`.
+- **Default**: the `Finding` and `Report` models contain only fingerprint,
+  redacted display value, metadata, and safe context—no recoverable raw field.
+  Human, JSON, SARIF, serialization, and debug output therefore cannot recover
+  matched plaintext.
+- **Local `--unredacted` only**: secrets render in full through separate,
+  explicitly unsafe finding/report types. JSON includes `raw`,
+  `"unsafe_output": true`, and a warning. GitHub/Slack reject the flag before
+  access; SARIF conflicts with it.
   Human report leads with `!! UNREDACTED OUTPUT — this report contains
   live secrets. Treat it as such.`
 - Detection completes across the entire input before any context is
@@ -159,7 +165,7 @@ Hand-written regex set with optional Shannon-entropy + length gates.
 | Dev-platform tokens | GitHub token (PAT / OAuth / App / refresh — `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`), GitLab (`glpat-…`), Atlassian (`ATATT3…`), Sourcegraph (`sgp_…`), Slack bot/user/app tokens, Slack webhook URLs, Stripe live/test, NPM, JWT |
 | Database / data     | PlanetScale (`pscale_pw_…`), Supabase service-role JWT, Neon Postgres URL (`*.neon.tech` with embedded password) |
 | Messaging           | Telegram bot tokens, Discord bot tokens, SendGrid (`SG.<22>.<43>`)     |
-| Cryptographic       | PEM private-key block opener                                           |
+| Cryptographic       | Complete bounded PEM private-key block                                 |
 | Generic backstop    | High-entropy string near `key`/`token`/`secret`/`password` keyword     |
 
 The generic backstop only fires when (a) entropy ≥ 4.0 bits/byte
