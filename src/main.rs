@@ -102,11 +102,11 @@ async fn main() -> Result<()> {
 async fn run_local(path: PathBuf, out: OutputArgs) -> Result<()> {
     let source = format!("local:{}", path.display());
     if out.unredacted {
-        let findings = sources::local::scan_directory_unredacted(&path).await?;
-        emit_unredacted(&source, findings, out)
+        let outcome = sources::local::scan_directory_unredacted(&path).await?;
+        emit_unredacted(&source, outcome, out)
     } else {
-        let findings = sources::local::scan_directory(&path).await?;
-        emit(&source, findings, out)
+        let outcome = sources::local::scan_directory(&path).await?;
+        emit(&source, outcome, out)
     }
 }
 
@@ -122,7 +122,7 @@ async fn run_github(
         Some((o, r)) => (o.to_string(), Some(r.to_string())),
         None => (owner_arg.clone(), None),
     };
-    let findings = sources::github::scan_owner(
+    let outcome = sources::github::scan_owner(
         &client,
         &owner,
         repo.as_deref(),
@@ -131,25 +131,25 @@ async fn run_github(
     )
     .await
     .with_context(|| format!("scan github://{}", owner_arg))?;
-    emit(&format!("github://{}", owner_arg), findings, out)
+    emit(&format!("github://{}", owner_arg), outcome, out)
 }
 
 async fn run_slack(days: i64, out: OutputArgs) -> Result<()> {
     reject_remote_unredacted(&out, "slack")?;
     let client = sources::slack::SlackClient::from_env()?;
-    let findings = sources::slack::scan_workspace(&client, days).await?;
-    emit(&format!("slack://workspace?days={}", days), findings, out)
+    let outcome = sources::slack::scan_workspace(&client, days).await?;
+    emit(&format!("slack://workspace?days={}", days), outcome, out)
 }
 
 fn emit(
     source: &str,
-    findings: Vec<clavenar_shadow_scanner::Finding>,
+    outcome: sources::ScanOutcome<clavenar_shadow_scanner::Finding>,
     out: OutputArgs,
 ) -> Result<()> {
     let min = Severity::from_min(&out.severity_min)
         .with_context(|| format!("invalid --severity-min: {}", out.severity_min))?;
-    let findings = filter_by_min_severity(findings, min);
-    let report = Report::from_findings(source, findings);
+    let outcome = outcome.map_findings(|findings| filter_by_min_severity(findings, min));
+    let report = Report::from_outcome(source, outcome);
     let mut stdout = stdout().lock();
     if out.sarif {
         report.write_sarif(&mut stdout)?;
@@ -172,7 +172,7 @@ fn emit(
 
 fn emit_unredacted(
     source: &str,
-    findings: Vec<clavenar_shadow_scanner::UnsafeFinding>,
+    outcome: sources::ScanOutcome<clavenar_shadow_scanner::UnsafeFinding>,
     out: OutputArgs,
 ) -> Result<()> {
     if out.sarif {
@@ -180,8 +180,8 @@ fn emit_unredacted(
     }
     let min = Severity::from_min(&out.severity_min)
         .with_context(|| format!("invalid --severity-min: {}", out.severity_min))?;
-    let findings = filter_unsafe_by_min_severity(findings, min);
-    let report = UnsafeReport::from_findings(source, findings);
+    let outcome = outcome.map_findings(|findings| filter_unsafe_by_min_severity(findings, min));
+    let report = UnsafeReport::from_outcome(source, outcome);
     let mut stdout = stdout().lock();
     if out.json {
         report.write_json(&mut stdout)?;

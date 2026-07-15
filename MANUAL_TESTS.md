@@ -39,6 +39,23 @@ release candidate.
 2. Confirm default JSON has no `raw` member and still carries `fingerprint` and
    `redacted` fields.
 
+## Typed coverage outcome
+
+1. Scan one clean UTF-8 file with human, JSON, and SARIF output. Confirm all
+   formats report one object, its exact byte count, zero skips/errors,
+   `truncated=false`, and `partial=false`.
+2. Add one synthetic binary file and one file over 1 MiB. Confirm findings from
+   the readable file remain, both excluded files are counted as skipped, and
+   `partial=true` in human, JSON, and SARIF coverage.
+3. Scan a nonexistent local root. Confirm JSON contains a structured `walk`
+   source error, zero scanned objects, and `partial=true`, without file content
+   or a credential value in the error.
+4. Run the GitHub and Slack source-failure unit tests. Confirm repository and
+   conversation-list failures return typed partial outcomes instead of an
+   empty, complete result.
+5. Repeat the complete synthetic-credential corpus and confirm adding coverage
+   metadata does not place any raw value in default human, JSON, or SARIF.
+
 ## Static release artifact
 
 1. Download the tarball and `.sha256` companion for the target architecture.

@@ -92,6 +92,7 @@ pub(super) fn write(report: &Report, mut w: impl Write) -> std::io::Result<()> {
                 "source": report.source,
                 "scanned_at": report.scanned_at.to_rfc3339(),
                 "total_findings": report.total_findings,
+                "coverage": report.coverage,
             },
             "results": results,
         }],
@@ -116,6 +117,7 @@ fn severity_to_sarif_level(s: Severity) -> &'static str {
 mod tests {
     use super::*;
     use crate::detector::{Finding, Severity};
+    use crate::sources::{ScanOutcome, SourceError, SourceErrorKind};
 
     fn finding(detector: &str, sev: Severity, raw: &str, loc: &str, line: u32) -> Finding {
         Finding::from_match(detector.into(), sev, loc.into(), line, raw, None)
@@ -244,5 +246,23 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn sarif_properties_carry_typed_partial_coverage() {
+        let mut outcome = ScanOutcome::from_findings(Vec::<Finding>::new());
+        outcome.record_error(SourceError::new(
+            SourceErrorKind::Tree,
+            "owner/repo",
+            "tree unavailable",
+        ));
+        let report = Report::from_outcome("test", outcome);
+        let mut buf = Vec::new();
+        report.write_sarif(&mut buf).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        let coverage = &value["runs"][0]["properties"]["coverage"];
+        assert_eq!(coverage["objects_scanned"], 0);
+        assert_eq!(coverage["source_errors"][0]["kind"], "tree");
+        assert_eq!(coverage["partial"], true);
     }
 }

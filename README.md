@@ -34,7 +34,7 @@ No account, no sign-up — grab the static binary and run.
 runtime deps, no installer):
 
 ```bash
-V=0.1.2
+V=0.1.3
 curl -fsSL "https://github.com/clavenar/clavenar-shadow-scanner/releases/download/v${V}/clavenar-shadow-scanner-${V}-x86_64-linux-musl.tar.gz" \
   | tar -xz
 ./clavenar-shadow-scanner local ~
@@ -98,6 +98,21 @@ Output flags (`--unredacted` is local-only; the others are common):
                                   Drop findings below this severity (default: low).
 ```
 
+### Coverage outcome
+
+Every source returns the same typed `ScanOutcome`: findings plus a `coverage`
+object containing `objects_scanned`, `bytes_scanned`, `objects_skipped`,
+structured `source_errors`, `truncated`, and `partial`. Objects are readable
+text files for local scans, fetched blobs for GitHub, and non-empty messages
+for Slack. `partial` is an invariant: any skip, source error, or truncation
+sets it to `true`; inconsistent coverage JSON is rejected on deserialization.
+
+Human and JSON reports show the complete coverage state. SARIF carries it at
+`runs[0].properties.coverage`. Explicit local unsafe reports use the same
+coverage model. In this release `truncated` is schema-backed, but GitHub's
+recursive-tree truncation signal is not yet detected; a `false` value does not
+by itself prove the GitHub API returned the complete tree.
+
 ### CI integration
 
 ```yaml
@@ -124,9 +139,11 @@ auto-resolve once the secret is removed.
 
 ## Exit codes
 
-- `0` — no findings (or only `medium`/`low` findings).
+- `0` — no `high`/`critical` findings (or only `medium`/`low` findings).
+  Coverage can still be partial in this release; CI must inspect
+  `coverage.partial` until threshold-based exit enforcement lands.
 - `2` — at least one `high` or `critical` finding. CI-friendly.
-- `1` — runtime error (bad auth, network, etc.).
+- `1` — command setup or fatal runtime error before a typed outcome exists.
 
 ## Output safety
 

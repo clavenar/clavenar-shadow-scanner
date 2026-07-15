@@ -150,12 +150,12 @@ source access.
   four-tier severity onto SARIF's three levels: `Critical`/`High` →
   `error`, `Medium` → `warning`, `Low` → `note`.
 - **Properties bag.** `runs[0].properties` carries `source`,
-  `scanned_at` (RFC 3339), and `total_findings`; SARIF parsers ignore
-  unknown keys.
+  `scanned_at` (RFC 3339), `total_findings`, and the typed `coverage`
+  object; SARIF parsers ignore unknown keys.
 
 ---
 *Re-verify against `build_detectors` / `Severity` in
 [`src/detector.rs`](../src/detector.rs), `emit` in
-[`src/main.rs`](../src/main.rs), `Report::from_findings` in
+[`src/main.rs`](../src/main.rs), `Report::from_outcome` in
 [`src/output/mod.rs`](../src/output/mod.rs), and `write` /
 `severity_to_sarif_level` in [`src/output/sarif.rs`](../src/output/sarif.rs).*

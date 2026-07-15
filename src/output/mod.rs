@@ -10,6 +10,7 @@
 mod sarif;
 
 use crate::detector::{Finding, Severity, UnsafeFinding};
+use crate::sources::{ScanCoverage, ScanOutcome};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -35,6 +36,8 @@ pub struct Location {
 pub struct Report {
     pub source: String,
     pub scanned_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub coverage: ScanCoverage,
     pub aggregates: Vec<Aggregate>,
     pub total_findings: usize,
 }
@@ -42,6 +45,16 @@ pub struct Report {
 impl Report {
     /// Group `findings` by fingerprint and produce a `Report`.
     pub fn from_findings(source: impl Into<String>, findings: Vec<Finding>) -> Self {
+        Self::from_outcome(source, ScanOutcome::from_findings(findings))
+    }
+
+    /// Group a typed scan outcome while preserving its source coverage.
+    pub fn from_outcome(source: impl Into<String>, outcome: ScanOutcome<Finding>) -> Self {
+        let (findings, coverage) = outcome.into_parts();
+        Self::build(source, findings, coverage)
+    }
+
+    fn build(source: impl Into<String>, findings: Vec<Finding>, coverage: ScanCoverage) -> Self {
         let total_findings = findings.len();
         // BTreeMap so output ordering is stable across runs (helpful for
         // diffs in CI).
@@ -90,6 +103,7 @@ impl Report {
         Self {
             source: source.into(),
             scanned_at: chrono::Utc::now(),
+            coverage,
             aggregates,
             total_findings,
         }
@@ -118,6 +132,7 @@ impl Report {
             self.aggregates.len(),
             self.total_findings
         )?;
+        write_human_coverage(&self.coverage, &mut w)?;
         writeln!(w)?;
 
         if self.aggregates.is_empty() {
@@ -185,12 +200,18 @@ pub struct UnsafeReport {
     pub warning: &'static str,
     pub source: String,
     pub scanned_at: chrono::DateTime<chrono::Utc>,
+    pub coverage: ScanCoverage,
     pub aggregates: Vec<UnsafeAggregate>,
     pub total_findings: usize,
 }
 
 impl UnsafeReport {
     pub fn from_findings(source: impl Into<String>, findings: Vec<UnsafeFinding>) -> Self {
+        Self::from_outcome(source, ScanOutcome::from_findings(findings))
+    }
+
+    pub fn from_outcome(source: impl Into<String>, outcome: ScanOutcome<UnsafeFinding>) -> Self {
+        let (findings, coverage) = outcome.into_parts();
         let mut raw_by_fingerprint = BTreeMap::new();
         let safe_findings = findings
             .into_iter()
@@ -202,7 +223,7 @@ impl UnsafeReport {
                 safe
             })
             .collect();
-        let report = Report::from_findings(source, safe_findings);
+        let report = Report::build(source, safe_findings, coverage);
         let aggregates = report
             .aggregates
             .into_iter()
@@ -222,6 +243,7 @@ impl UnsafeReport {
             warning: UNSAFE_OUTPUT_WARNING,
             source: report.source,
             scanned_at: report.scanned_at,
+            coverage: report.coverage,
             aggregates,
             total_findings: report.total_findings,
         }
@@ -248,6 +270,7 @@ impl UnsafeReport {
             self.aggregates.len(),
             self.total_findings
         )?;
+        write_human_coverage(&self.coverage, &mut w)?;
         writeln!(w)?;
 
         if self.aggregates.is_empty() {
@@ -290,6 +313,33 @@ impl UnsafeReport {
     }
 }
 
+fn write_human_coverage(coverage: &ScanCoverage, mut w: impl Write) -> std::io::Result<()> {
+    writeln!(
+        w,
+        "coverage: scanned={} object(s)/{} byte(s)  skipped={}  errors={}  truncated={}  partial={}",
+        coverage.objects_scanned(),
+        coverage.bytes_scanned(),
+        coverage.objects_skipped(),
+        coverage.source_errors().len(),
+        coverage.truncated(),
+        coverage.partial()
+    )?;
+    if !coverage.source_errors().is_empty() {
+        writeln!(w, "source errors:")?;
+        for error in coverage.source_errors().iter().take(5) {
+            writeln!(w, "  - {:?} {}: {}", error.kind, error.item, error.message)?;
+        }
+        if coverage.source_errors().len() > 5 {
+            writeln!(
+                w,
+                "  - … {} more (use --json for full list)",
+                coverage.source_errors().len() - 5
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Filter findings by minimum severity. `Severity::Critical` is the
 /// most-severe and orders smallest under our `Ord` impl, so "≥ severity"
 /// means "ord <= chosen" in our enum direction.
@@ -311,6 +361,7 @@ pub fn filter_unsafe_by_min_severity(
 mod tests {
     use super::*;
     use crate::detector::{Severity, scan_text_unredacted};
+    use crate::sources::{SourceError, SourceErrorKind};
 
     fn finding(detector: &str, sev: Severity, raw: &str, loc: &str, line: u32) -> Finding {
         Finding::from_match(detector.into(), sev, loc.into(), line, raw, None)
@@ -348,6 +399,38 @@ mod tests {
     }
 
     #[test]
+    fn typed_coverage_is_preserved_in_json_and_human_output() {
+        let mut outcome = ScanOutcome::from_findings(Vec::<Finding>::new());
+        outcome.record_scanned(17);
+        outcome.record_skipped();
+        outcome.record_error(SourceError::new(
+            SourceErrorKind::Read,
+            "synthetic/file",
+            "permission denied",
+        ));
+        outcome.mark_truncated();
+        let report = Report::from_outcome("test", outcome);
+
+        let mut json = Vec::new();
+        report.write_json(&mut json).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["coverage"]["objects_scanned"], 1);
+        assert_eq!(value["coverage"]["bytes_scanned"], 17);
+        assert_eq!(value["coverage"]["objects_skipped"], 1);
+        assert_eq!(value["coverage"]["source_errors"][0]["kind"], "read");
+        assert_eq!(value["coverage"]["truncated"], true);
+        assert_eq!(value["coverage"]["partial"], true);
+
+        let mut human = Vec::new();
+        report.write_human(&mut human).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(human.contains("scanned=1 object(s)/17 byte(s)"));
+        assert!(human.contains("skipped=1  errors=1"));
+        assert!(human.contains("truncated=true  partial=true"));
+        assert!(human.contains("synthetic/file: permission denied"));
+    }
+
+    #[test]
     fn unsafe_json_output_includes_raw_and_warning() {
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
         let r = UnsafeReport::from_findings("test", scan_text_unredacted(key, "a"));
@@ -357,6 +440,20 @@ mod tests {
         assert!(s.contains(key));
         assert!(s.contains("\"unsafe_output\": true"));
         assert!(s.contains(UNSAFE_OUTPUT_WARNING));
+    }
+
+    #[test]
+    fn unsafe_report_preserves_typed_coverage() {
+        let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
+        let mut outcome = ScanOutcome::from_findings(scan_text_unredacted(key, "a"));
+        outcome.record_scanned(key.len());
+        let report = UnsafeReport::from_outcome("test", outcome);
+        let mut json = Vec::new();
+        report.write_json(&mut json).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["coverage"]["objects_scanned"], 1);
+        assert_eq!(value["coverage"]["bytes_scanned"], key.len());
+        assert_eq!(value["coverage"]["partial"], false);
     }
 
     #[test]

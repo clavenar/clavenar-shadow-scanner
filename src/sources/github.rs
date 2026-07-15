@@ -7,7 +7,9 @@
 //! Rate-limit handling: 403 with `X-RateLimit-Remaining: 0` sleeps until
 //! `X-RateLimit-Reset`; 429 backs off 30s; anything else surfaces.
 
-use super::{MAX_FILE_BYTES, USER_AGENT_VALUE, looks_binary};
+use super::{
+    MAX_FILE_BYTES, ScanOutcome, SourceError, SourceErrorKind, USER_AGENT_VALUE, looks_binary,
+};
 use crate::detector::{Finding, scan_text};
 use anyhow::{Context, Result, bail};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
@@ -288,41 +290,70 @@ pub async fn scan_owner(
     repo_filter: Option<&str>,
     include_forks: bool,
     include_archived: bool,
-) -> Result<Vec<Finding>> {
-    let repos = match repo_filter {
-        Some(name) => vec![client.get_repo(owner, name).await?],
-        None => client.list_repos(owner).await?,
+) -> Result<ScanOutcome<Finding>> {
+    let mut outcome = ScanOutcome::default();
+    let repos_result = match repo_filter {
+        Some(name) => client.get_repo(owner, name).await.map(|repo| vec![repo]),
+        None => client.list_repos(owner).await,
     };
-    let mut findings = Vec::new();
+    let repos = match repos_result {
+        Ok(repos) => repos,
+        Err(error) => {
+            outcome.record_error(SourceError::new(
+                SourceErrorKind::Repository,
+                repo_filter
+                    .map(|repo| format!("{owner}/{repo}"))
+                    .unwrap_or_else(|| owner.to_string()),
+                error.to_string(),
+            ));
+            return Ok(outcome);
+        }
+    };
     for repo in repos {
         if !include_forks && repo.fork {
+            outcome.record_skipped();
             continue;
         }
         if !include_archived && repo.archived {
+            outcome.record_skipped();
             continue;
         }
-        match scan_repo(client, owner, &repo).await {
-            Ok(mut fs) => {
-                tracing::info!("scanned {}: {} findings", repo.full_name, fs.len());
-                findings.append(&mut fs);
-            }
-            Err(e) => tracing::warn!("skip repo {}: {}", repo.full_name, e),
-        }
+        let repo_outcome = scan_repo(client, owner, &repo).await;
+        tracing::info!(
+            "scanned {}: {} findings",
+            repo.full_name,
+            repo_outcome.findings.len()
+        );
+        outcome.merge(repo_outcome);
     }
-    Ok(findings)
+    Ok(outcome)
 }
 
-async fn scan_repo(client: &GitHubClient, owner: &str, repo: &RepoSummary) -> Result<Vec<Finding>> {
-    let tree = client
+async fn scan_repo(client: &GitHubClient, owner: &str, repo: &RepoSummary) -> ScanOutcome<Finding> {
+    let mut outcome = ScanOutcome::default();
+    let tree = match client
         .list_tree(owner, &repo.name, &repo.default_branch)
-        .await?;
-    let mut out = Vec::new();
+        .await
+    {
+        Ok(tree) => tree,
+        Err(error) => {
+            tracing::warn!("skip repo {}: {}", repo.full_name, error);
+            outcome.record_error(SourceError::new(
+                SourceErrorKind::Tree,
+                repo.full_name.clone(),
+                error.to_string(),
+            ));
+            return outcome;
+        }
+    };
     for entry in tree {
         // Skip oversized blobs and obviously-binary paths.
         if entry.size.unwrap_or(0) > MAX_FILE_BYTES {
+            outcome.record_skipped();
             continue;
         }
         if has_binary_extension(&entry.path) {
+            outcome.record_skipped();
             continue;
         }
         let bytes = match client
@@ -332,19 +363,27 @@ async fn scan_repo(client: &GitHubClient, owner: &str, repo: &RepoSummary) -> Re
             Ok(b) => b,
             Err(e) => {
                 tracing::debug!("blob fetch {}/{}: {}", repo.full_name, entry.path, e);
+                outcome.record_error(SourceError::new(
+                    SourceErrorKind::Blob,
+                    format!("{}:{}", repo.full_name, entry.path),
+                    e.to_string(),
+                ));
                 continue;
             }
         };
-        if looks_binary(&bytes) {
+        if bytes.len() as u64 > MAX_FILE_BYTES || looks_binary(&bytes) {
+            outcome.record_skipped();
             continue;
         }
         let Ok(text) = std::str::from_utf8(&bytes) else {
+            outcome.record_skipped();
             continue;
         };
         let location = format!("{}:{}@{}", repo.full_name, entry.path, repo.default_branch);
-        out.extend(scan_text(text, &location));
+        outcome.record_scanned(bytes.len());
+        outcome.findings.extend(scan_text(text, &location));
     }
-    Ok(out)
+    outcome
 }
 
 fn has_binary_extension(path: &str) -> bool {
@@ -371,5 +410,21 @@ mod tests {
         assert!(has_binary_extension("path/to/lib.so"));
         assert!(!has_binary_extension("README.md"));
         assert!(!has_binary_extension("src/main.rs"));
+    }
+
+    #[tokio::test]
+    async fn repository_failure_is_a_typed_partial_error() {
+        let client = GitHubClient::from_env().with_base_url("http://127.0.0.1:9");
+        let outcome = scan_owner(&client, "owner", Some("repo"), false, false)
+            .await
+            .unwrap();
+        assert!(outcome.findings.is_empty());
+        assert_eq!(outcome.coverage().objects_scanned(), 0);
+        assert_eq!(outcome.coverage().source_errors().len(), 1);
+        assert_eq!(
+            outcome.coverage().source_errors()[0].kind,
+            SourceErrorKind::Repository
+        );
+        assert!(outcome.coverage().partial());
     }
 }

@@ -9,7 +9,7 @@
 //! surface without much marginal lift over "did anyone paste a key into
 //! a public channel."
 
-use super::USER_AGENT_VALUE;
+use super::{ScanOutcome, SourceError, SourceErrorKind, USER_AGENT_VALUE};
 use crate::detector::{Finding, scan_text};
 use anyhow::{Context, Result, bail};
 use chrono::{Duration as CDuration, Utc};
@@ -205,13 +205,27 @@ struct ResponseMetadata {
 
 /// Top-level driver: scan every conversation the bot is a member of,
 /// looking back `lookback_days` days. Skips archived channels.
-pub async fn scan_workspace(client: &SlackClient, lookback_days: i64) -> Result<Vec<Finding>> {
-    let conversations = client.list_conversations().await?;
+pub async fn scan_workspace(
+    client: &SlackClient,
+    lookback_days: i64,
+) -> Result<ScanOutcome<Finding>> {
+    let mut outcome = ScanOutcome::default();
+    let conversations = match client.list_conversations().await {
+        Ok(conversations) => conversations,
+        Err(error) => {
+            outcome.record_error(SourceError::new(
+                SourceErrorKind::ConversationList,
+                "slack://workspace",
+                error.to_string(),
+            ));
+            return Ok(outcome);
+        }
+    };
     let since = (Utc::now() - CDuration::days(lookback_days)).timestamp() as f64;
 
-    let mut findings = Vec::new();
     for conv in conversations {
         if conv.is_archived || !conv.is_member {
+            outcome.record_skipped();
             continue;
         }
         let label = conv.name.clone().unwrap_or_else(|| conv.id.clone());
@@ -219,17 +233,26 @@ pub async fn scan_workspace(client: &SlackClient, lookback_days: i64) -> Result<
             Ok(messages) => {
                 for msg in messages {
                     if msg.text.is_empty() {
+                        outcome.record_skipped();
                         continue;
                     }
                     let location = format!("slack://{}/{}", label, msg.ts);
-                    findings.extend(scan_text(&msg.text, &location));
+                    outcome.record_scanned(msg.text.len());
+                    outcome.findings.extend(scan_text(&msg.text, &location));
                 }
                 tracing::info!("scanned slack channel {}", label);
             }
-            Err(e) => tracing::warn!("skip slack channel {}: {}", label, e),
+            Err(error) => {
+                tracing::warn!("skip slack channel {}: {}", label, error);
+                outcome.record_error(SourceError::new(
+                    SourceErrorKind::ChannelHistory,
+                    format!("slack://{label}"),
+                    error.to_string(),
+                ));
+            }
         }
     }
-    Ok(findings)
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -244,5 +267,23 @@ mod tests {
     #[test]
     fn urlencoding_escapes_special() {
         assert_eq!(urlencoding("a/b+c=d"), "a%2Fb%2Bc%3Dd");
+    }
+
+    #[tokio::test]
+    async fn conversation_failure_is_a_typed_partial_error() {
+        let client = SlackClient {
+            http: reqwest::Client::new(),
+            token: "synthetic-test-token".into(),
+            base_url: "http://127.0.0.1:9".into(),
+        };
+        let outcome = scan_workspace(&client, 1).await.unwrap();
+        assert!(outcome.findings.is_empty());
+        assert_eq!(outcome.coverage().objects_scanned(), 0);
+        assert_eq!(outcome.coverage().source_errors().len(), 1);
+        assert_eq!(
+            outcome.coverage().source_errors()[0].kind,
+            SourceErrorKind::ConversationList
+        );
+        assert!(outcome.coverage().partial());
     }
 }

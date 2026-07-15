@@ -42,6 +42,13 @@ fn local_scan_emits_redacted_json_with_planted_anthropic_key() {
         !stdout.contains(key),
         "raw key leaked into default JSON output"
     );
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["coverage"]["objects_scanned"], 1);
+    assert!(report["coverage"]["bytes_scanned"].as_u64().unwrap() > 0);
+    assert_eq!(report["coverage"]["objects_skipped"], 0);
+    assert_eq!(report["coverage"]["source_errors"], serde_json::json!([]));
+    assert_eq!(report["coverage"]["truncated"], false);
+    assert_eq!(report["coverage"]["partial"], false);
 }
 
 #[test]
@@ -58,6 +65,8 @@ fn local_scan_clean_dir_exits_zero() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("\"total_findings\": 0"));
+    assert!(stdout.contains("\"objects_scanned\": 1"));
+    assert!(stdout.contains("\"partial\": false"));
 }
 
 #[test]

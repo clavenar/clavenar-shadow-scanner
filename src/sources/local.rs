@@ -10,65 +10,109 @@
 //! `ignore`'s walker is synchronous, so we drive it via
 //! [`tokio::task::spawn_blocking`] to avoid stalling the runtime.
 
-use super::{MAX_FILE_BYTES, looks_binary};
+use super::{MAX_FILE_BYTES, ScanOutcome, SourceError, SourceErrorKind, looks_binary};
 use crate::detector::{Finding, UnsafeFinding, scan_text, scan_text_unredacted};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Scan `root` recursively. Returns every finding from every text file
-/// the walker visits. Errors during a single file are logged and the
-/// scan continues — we don't want one unreadable file to wedge an
-/// org-wide scan.
-pub async fn scan_directory(root: &Path) -> Result<Vec<Finding>> {
+/// Scan `root` recursively and return findings with complete coverage
+/// accounting. Errors during one item become typed partial-coverage records;
+/// they do not erase findings from other readable files.
+pub async fn scan_directory(root: &Path) -> Result<ScanOutcome<Finding>> {
     let root = root.to_path_buf();
     // The `ignore` walker is synchronous. Push the whole walk onto the
     // blocking pool; we collect a `Vec<PathBuf>` first, then read +
     // scan asynchronously. Trading a small upfront allocation for a
     // simpler async story.
-    let paths: Vec<PathBuf> = tokio::task::spawn_blocking(move || gather_paths(&root))
+    let gathered = tokio::task::spawn_blocking(move || gather_paths(&root))
         .await
-        .context("spawn_blocking gather_paths")??;
+        .context("spawn_blocking gather_paths")?;
 
-    let mut findings = Vec::new();
-    for path in paths {
+    let mut outcome = ScanOutcome::default();
+    for error in gathered.errors {
+        outcome.record_error(error);
+    }
+    for path in gathered.paths {
         match scan_one_file(&path).await {
-            Ok(mut fs) => findings.append(&mut fs),
-            Err(e) => tracing::warn!("skip {}: {}", path.display(), e),
+            Ok(FileScan::Scanned {
+                mut findings,
+                bytes,
+            }) => {
+                outcome.record_scanned(bytes);
+                outcome.append_findings(&mut findings);
+            }
+            Ok(FileScan::Skipped) => outcome.record_skipped(),
+            Err(error) => {
+                tracing::warn!("skip {}: {}", path.display(), error);
+                outcome.record_error(SourceError::new(
+                    SourceErrorKind::Read,
+                    path.display().to_string(),
+                    error.to_string(),
+                ));
+            }
         }
     }
-    Ok(findings)
+    Ok(outcome)
 }
 
 /// Explicit local-only scan that retains raw matches for visibly marked unsafe
 /// output. Remote sources do not expose an equivalent entry point.
-pub async fn scan_directory_unredacted(root: &Path) -> Result<Vec<UnsafeFinding>> {
+pub async fn scan_directory_unredacted(root: &Path) -> Result<ScanOutcome<UnsafeFinding>> {
     let root = root.to_path_buf();
-    let paths: Vec<PathBuf> = tokio::task::spawn_blocking(move || gather_paths(&root))
+    let gathered = tokio::task::spawn_blocking(move || gather_paths(&root))
         .await
-        .context("spawn_blocking gather_paths")??;
+        .context("spawn_blocking gather_paths")?;
 
-    let mut findings = Vec::new();
-    for path in paths {
+    let mut outcome = ScanOutcome::default();
+    for error in gathered.errors {
+        outcome.record_error(error);
+    }
+    for path in gathered.paths {
         match scan_one_file_unredacted(&path).await {
-            Ok(mut file_findings) => findings.append(&mut file_findings),
-            Err(error) => tracing::warn!("skip {}: {}", path.display(), error),
+            Ok(FileScan::Scanned {
+                mut findings,
+                bytes,
+            }) => {
+                outcome.record_scanned(bytes);
+                outcome.append_findings(&mut findings);
+            }
+            Ok(FileScan::Skipped) => outcome.record_skipped(),
+            Err(error) => {
+                tracing::warn!("skip {}: {}", path.display(), error);
+                outcome.record_error(SourceError::new(
+                    SourceErrorKind::Read,
+                    path.display().to_string(),
+                    error.to_string(),
+                ));
+            }
         }
     }
-    Ok(findings)
+    Ok(outcome)
 }
 
-fn gather_paths(root: &Path) -> Result<Vec<PathBuf>> {
+struct GatheredPaths {
+    paths: Vec<PathBuf>,
+    errors: Vec<SourceError>,
+}
+
+fn gather_paths(root: &Path) -> GatheredPaths {
     let walker = ignore::WalkBuilder::new(root)
         .standard_filters(true)
         .hidden(false) // we *do* want to look at dotfiles like .env
         .build();
 
-    let mut out = Vec::new();
+    let mut paths = Vec::new();
+    let mut errors = Vec::new();
     for dent in walker {
         let dent = match dent {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("walk error: {}", e);
+                errors.push(SourceError::new(
+                    SourceErrorKind::Walk,
+                    root.display().to_string(),
+                    e.to_string(),
+                ));
                 continue;
             }
         };
@@ -80,23 +124,34 @@ fn gather_paths(root: &Path) -> Result<Vec<PathBuf>> {
         }
         // Defer the size + binary heuristics to scan_one_file; here we
         // just collect candidate paths.
-        out.push(path.to_path_buf());
+        paths.push(path.to_path_buf());
     }
-    Ok(out)
+    GatheredPaths { paths, errors }
 }
 
-async fn scan_one_file(path: &Path) -> Result<Vec<Finding>> {
-    let Some(text) = read_scannable_file(path).await? else {
-        return Ok(Vec::new());
-    };
-    Ok(scan_text(&text, &path.display().to_string()))
+enum FileScan<F> {
+    Scanned { findings: Vec<F>, bytes: usize },
+    Skipped,
 }
 
-async fn scan_one_file_unredacted(path: &Path) -> Result<Vec<UnsafeFinding>> {
+async fn scan_one_file(path: &Path) -> Result<FileScan<Finding>> {
     let Some(text) = read_scannable_file(path).await? else {
-        return Ok(Vec::new());
+        return Ok(FileScan::Skipped);
     };
-    Ok(scan_text_unredacted(&text, &path.display().to_string()))
+    Ok(FileScan::Scanned {
+        bytes: text.len(),
+        findings: scan_text(&text, &path.display().to_string()),
+    })
+}
+
+async fn scan_one_file_unredacted(path: &Path) -> Result<FileScan<UnsafeFinding>> {
+    let Some(text) = read_scannable_file(path).await? else {
+        return Ok(FileScan::Skipped);
+    };
+    Ok(FileScan::Scanned {
+        bytes: text.len(),
+        findings: scan_text_unredacted(&text, &path.display().to_string()),
+    })
 }
 
 async fn read_scannable_file(path: &Path) -> Result<Option<String>> {
@@ -140,12 +195,18 @@ mod tests {
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
         fs::write(nested.join(".env"), format!("ANTHROPIC_API_KEY={}\n", key)).unwrap();
 
-        let findings = scan_directory(dir.path()).await.unwrap();
+        let outcome = scan_directory(dir.path()).await.unwrap();
         assert!(
-            findings.iter().any(|f| f.detector == "anthropic_api_key"),
+            outcome
+                .findings
+                .iter()
+                .any(|f| f.detector == "anthropic_api_key"),
             "no anthropic finding: {:?}",
-            findings
+            outcome.findings
         );
+        assert_eq!(outcome.coverage().objects_scanned(), 1);
+        assert!(outcome.coverage().bytes_scanned() > 0);
+        assert!(!outcome.coverage().partial());
     }
 
     #[tokio::test]
@@ -169,11 +230,14 @@ mod tests {
         // robustness.
         fs::create_dir_all(dir.path().join(".git")).unwrap();
 
-        let findings = scan_directory(dir.path()).await.unwrap();
+        let outcome = scan_directory(dir.path()).await.unwrap();
         assert!(
-            !findings.iter().any(|f| f.location.contains("node_modules")),
+            !outcome
+                .findings
+                .iter()
+                .any(|f| f.location.contains("node_modules")),
             "ignored path leaked into findings: {:?}",
-            findings
+            outcome.findings
         );
     }
 
@@ -186,12 +250,14 @@ mod tests {
             "\nANTHROPIC_API_KEY=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW\n",
         );
         fs::write(dir.path().join("big.txt"), buf).unwrap();
-        let findings = scan_directory(dir.path()).await.unwrap();
+        let outcome = scan_directory(dir.path()).await.unwrap();
         assert!(
-            findings.is_empty(),
+            outcome.findings.is_empty(),
             "scanned an oversized file: {:?}",
-            findings
+            outcome.findings
         );
+        assert_eq!(outcome.coverage().objects_skipped(), 1);
+        assert!(outcome.coverage().partial());
     }
 
     #[tokio::test]
@@ -204,7 +270,27 @@ mod tests {
             b"ANTHROPIC_API_KEY=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW\n",
         );
         fs::write(dir.path().join("opaque.bin"), buf).unwrap();
-        let findings = scan_directory(dir.path()).await.unwrap();
-        assert!(findings.is_empty(), "binary file scanned: {:?}", findings);
+        let outcome = scan_directory(dir.path()).await.unwrap();
+        assert!(
+            outcome.findings.is_empty(),
+            "binary file scanned: {:?}",
+            outcome.findings
+        );
+        assert_eq!(outcome.coverage().objects_skipped(), 1);
+        assert!(outcome.coverage().partial());
+    }
+
+    #[tokio::test]
+    async fn missing_root_is_a_typed_partial_error() {
+        let dir = tempdir().unwrap();
+        let outcome = scan_directory(&dir.path().join("missing")).await.unwrap();
+        assert!(outcome.findings.is_empty());
+        assert_eq!(outcome.coverage().objects_scanned(), 0);
+        assert_eq!(outcome.coverage().source_errors().len(), 1);
+        assert_eq!(
+            outcome.coverage().source_errors()[0].kind,
+            SourceErrorKind::Walk
+        );
+        assert!(outcome.coverage().partial());
     }
 }

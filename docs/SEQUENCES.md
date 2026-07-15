@@ -4,7 +4,7 @@ Five sequence diagrams covering the wire-level paths the scanner can
 take: CLI dispatch + the shared `emit` pipeline, the gitignore-aware
 local-filesystem scan, the GitHub org / repo scan with rate-limit
 backoff, the Slack workspace scan, and the per-line detector engine
-that turns matched bytes into a deduped `Report`. A flowchart at the
+that turns matched bytes into a typed `ScanOutcome` and deduped `Report`. A flowchart at the
 end captures the request decision tree (source × output × severity
 filter × exit code).
 
@@ -42,9 +42,9 @@ sequenceDiagram
     break Command::Local with --unredacted
         Main->>Run: run_local(path, out)
         Run->>Src: sources::local::scan_directory_unredacted(path)
-        Src-->>Run: VecUnsafeFinding (raw retained deliberately)
-        Run->>Emit: emit_unredacted(source, findings, out)
-        Emit->>Rep: UnsafeReport::from_findings
+        Src-->>Run: ScanOutcomeUnsafeFinding (raw retained deliberately + typed coverage)
+        Run->>Emit: emit_unredacted(source, outcome, out)
+        Emit->>Rep: UnsafeReport::from_outcome
         Note over Emit,Rep: human banner; JSON unsafe_output=true + warning; no SARIF writer
         Rep-->>Emit: UnsafeReport carrying mandatory warning
         Emit->>Out: write unsafe human or JSON
@@ -63,15 +63,15 @@ sequenceDiagram
         Run->>Run: reject --unredacted before token/source access
         Run->>Src: sources::slack::scan_workspace(client, lookback_days)
     end
-    Src-->>Run: VecFinding (fingerprint + redacted value; no raw field)
-    Run->>Emit: emit(source_label, findings, out)
+    Src-->>Run: ScanOutcomeFinding (safe findings + typed coverage)
+    Run->>Emit: emit(source_label, outcome, out)
     Emit->>Sev: Severity::from_min(out.severity_min) — error if invalid
     Sev->>Emit: Severity enum
-    Emit->>Sev: filter_by_min_severity(findings, min)
-    Sev-->>Emit: filtered VecFinding
-    Emit->>Rep: Report::from_findings(source, filtered)
+    Emit->>Sev: outcome.map_findings(filter_by_min_severity)
+    Sev-->>Emit: filtered ScanOutcomeFinding
+    Emit->>Rep: Report::from_outcome(source, filtered outcome)
     Note over Emit,Rep: safe Finding, Aggregate, and Report models contain no recoverable raw value
-    Rep-->>Emit: Report { source, scanned_at, aggregates, total_findings }
+    Rep-->>Emit: Report { source, scanned_at, coverage, aggregates, total_findings }
     alt out.sarif
         Emit->>Out: report.write_sarif(stdout)
     else out.json
@@ -86,7 +86,7 @@ sequenceDiagram
     else no critical or high (or filtered out)
         Emit-->>Op: exit 0
     end
-    Note over Main,Op: runtime errors (bad auth, network) surface via anyhow → exit 1
+    Note over Main,Op: item/source failures stay in coverage; setup or fatal errors before an outcome exit 1
 ```
 
 ## 2. `local` — gitignore-aware filesystem walk
@@ -95,9 +95,9 @@ sequenceDiagram
 onto the blocking pool, collects every candidate path into a Vec,
 then reads + scans each file asynchronously. Per-file the metadata
 size cap, the NUL-byte binary heuristic, and the UTF-8 check all
-short-circuit before any regex work. Individual file failures
-`warn`-log and continue — one unreadable file never wedges an
-org-wide scan.
+short-circuit before any regex work. Individual file failures become
+structured source errors while other readable files continue. Every scanned,
+skipped, and errored item contributes to the returned coverage state.
 
 ```mermaid
 sequenceDiagram
@@ -117,37 +117,37 @@ sequenceDiagram
     loop walker entries
         Ignore-->>Gather: DirEntry or error
         alt walk error
-            Gather->>Gather: tracing::warn — walk error — continue
+            Gather->>Gather: record SourceError kind=walk — continue
         else file_type == file
             Gather->>Gather: out.push(path.to_path_buf)
         else dir / symlink / other
             Gather->>Gather: skip
         end
     end
-    Gather-->>Scan: VecPathBuf
+    Gather-->>Scan: GatheredPaths { paths, errors }
     deactivate Gather
     loop every collected path
         Scan->>Scan: scan_one_file(path)
         Scan->>Tokio: metadata(path)
         alt metadata err
             Tokio-->>Scan: Err
-            Scan->>Scan: tracing::warn skip path — continue
+            Scan->>Scan: record SourceError kind=read — continue
         else size > MAX_FILE_BYTES
             Tokio-->>Scan: metadata.len() > MAX_FILE_BYTES
-            Scan->>Scan: tracing::debug skip oversized — return Vec::new
+            Scan->>Scan: record skipped object — return FileScan::Skipped
         end
         Scan->>Tokio: read(path)
         Tokio-->>Scan: bytes
         Scan->>Scan: looks_binary (NUL-byte heuristic, same as git uses)
         alt binary
-            Scan->>Scan: tracing::debug skip binary — return Vec::new
+            Scan->>Scan: record skipped object — return FileScan::Skipped
         end
-        Scan->>Scan: std::str::from_utf8(&bytes) — not UTF-8 → return Vec::new
+        Scan->>Scan: std::str::from_utf8(&bytes) — not UTF-8 → record skipped object
         Scan->>Det: scan_text(text, path.display.to_string)
         Det-->>Scan: VecFinding
-        Scan->>Scan: findings.append(&mut fs)
+        Scan->>Scan: record scanned object/bytes + append findings
     end
-    Scan-->>Run: VecFinding
+    Scan-->>Run: ScanOutcomeFinding
 ```
 
 ## 3. `github` — owner-or-repo scan with rate-limit backoff
@@ -156,7 +156,7 @@ sequenceDiagram
 falls back to the 60-req/hour public ceiling). `scan_owner` either
 fetches one named repo or paginates `/orgs/{owner}/repos` →
 `/users/{owner}/repos` (whichever returns non-empty wins; both
-errors bubble up with context). Every HTTP call goes through a
+errors become typed repository coverage records). Every HTTP call goes through a
 retry-on-rate-limit loop that respects `X-RateLimit-Reset` and
 sleeps on 429 with a 30s backoff.
 
@@ -193,7 +193,7 @@ sequenceDiagram
                     List->>List: sleep 30s — retry
                 else non-2xx
                     Gh-->>List: status + body
-                    List-->>Scan: bail err
+                    List-->>Scan: source error
                 else 2xx
                     Gh-->>List: page JSON + Link header
                     List->>List: parse next_link — all.extend(page)
@@ -207,9 +207,9 @@ sequenceDiagram
     end
     loop every repo
         alt !include_forks AND repo.fork
-            Scan->>Scan: skip
+            Scan->>Scan: record skipped repo
         else !include_archived AND repo.archived
-            Scan->>Scan: skip
+            Scan->>Scan: record skipped repo
         else
             Scan->>Tree: list_tree(owner, repo.name, repo.default_branch)
             Tree->>Gh: GET /repos/.../git/trees/{branch}?recursive=1
@@ -217,21 +217,21 @@ sequenceDiagram
             Tree-->>Scan: VecTreeEntry
             loop every blob
                 alt size > MAX_FILE_BYTES OR has_binary_extension(path)
-                    Scan->>Scan: skip
+                    Scan->>Scan: record skipped blob
                 else
                     Scan->>Blob: fetch_blob(owner, repo, path, branch)
                     Blob->>Gh: GET /repos/.../contents/{path}?ref={branch} + Accept: application/vnd.github.raw
                     Gh-->>Blob: raw bytes (rate-limit-loop applies)
                     Blob-->>Scan: bytes
-                    Scan->>Scan: looks_binary OR utf8 decode fail → skip
+                    Scan->>Scan: looks_binary OR utf8 decode fail → record skipped blob
                     Scan->>Det: scan_text(text, "{owner}/{repo}:{path}@{branch}")
                     Det-->>Scan: VecFinding
-                    Scan->>Scan: out.extend(findings)
+                    Scan->>Scan: record scanned object/bytes + extend findings
                 end
             end
         end
     end
-    Scan-->>Run: VecFinding
+    Scan-->>Run: ScanOutcomeFinding
 ```
 
 ## 4. `slack` — workspace scan with cursor-paginated history
@@ -264,7 +264,7 @@ sequenceDiagram
         Conv->>Sl: GET /users.conversations?limit=200&types=public_channel,private_channel + Bearer token
         Sl-->>Conv: { ok, channels, response_metadata: { next_cursor } }
         alt ok == false
-            Conv-->>Scan: bail slack list_conversations: <error>
+            Conv-->>Scan: typed conversation_list source error
         else
             Conv->>Conv: out.extend(channels) — set cursor or break
         end
@@ -273,14 +273,14 @@ sequenceDiagram
     Scan->>Scan: since_ts = Utc::now - Duration::days(lookback_days)
     loop every conversation
         alt conv.is_archived OR !conv.is_member
-            Scan->>Scan: skip
+            Scan->>Scan: record skipped conversation
         else
             Scan->>Hist: fetch_history(channel_id, since_ts)
             loop until next_cursor empty
                 Hist->>Sl: GET /conversations.history?channel=...&oldest=since_ts&limit=200 + Bearer
                 Sl-->>Hist: { ok, messages, response_metadata }
                 alt ok == false
-                    Hist-->>Scan: bail slack history <id>: <error>
+                    Hist-->>Scan: typed channel_history source error
                 else
                     Hist->>Hist: out.extend(messages) — set cursor or break
                 end
@@ -288,21 +288,21 @@ sequenceDiagram
             Hist-->>Scan: VecSlackMessage
             loop every message
                 alt msg.text.is_empty
-                    Scan->>Scan: skip
+                    Scan->>Scan: record skipped message
                 else
                     Scan->>Det: scan_text(msg.text, "slack://{channel_label}/{ts}")
                     Det-->>Scan: VecFinding
-                    Scan->>Scan: findings.extend
+                    Scan->>Scan: record scanned object/bytes + extend findings
                 end
             end
             Scan->>Scan: tracing::info scanned slack channel <label>
         end
     end
-    Note over Hist,Scan: per-channel fetch_history error → warn and skip that channel — whole-workspace scan continues
-    Scan-->>Run: VecFinding
+    Note over Hist,Scan: per-channel fetch_history error → typed channel_history error; whole-workspace scan continues
+    Scan-->>Run: ScanOutcomeFinding
 ```
 
-## 5. Detector engine — `scan_text` + `Report::from_findings`
+## 5. Detector engine — `scan_text` + `Report::from_outcome`
 
 The detector engine is shared by all three sources. For every line
 under 4 KiB (pathological-regex guard), every detector's regex runs;
@@ -329,7 +329,7 @@ sequenceDiagram
     participant H as shannon_entropy
     participant Span as merge_spans
     participant Ctx as build_context
-    participant Rep as Report::from_findings
+    participant Rep as Report::from_outcome
     participant FP as fingerprint + redact while raw span is in scope
 
     Caller->>Scan: scan_text(text, location)
@@ -371,7 +371,7 @@ sequenceDiagram
     end
     Scan-->>Caller: VecFinding — no recoverable raw field
 
-    Caller->>Rep: Report::from_findings(source, findings)
+    Caller->>Rep: Report::from_outcome(source, ScanOutcome { findings, coverage })
     loop every finding
         Rep->>Rep: BTreeMap entry-or-insert Aggregate { fingerprint, detector, severity, redacted, locations: [] }
         alt f.severity < entry.severity
@@ -384,7 +384,7 @@ sequenceDiagram
         end
     end
     Rep->>Rep: collect into Vec — sort by (severity ASC, detector, fingerprint) for stable diff
-    Rep-->>Caller: Report { source, scanned_at: Utc::now, aggregates, total_findings }
+    Rep-->>Caller: Report { source, scanned_at: Utc::now, coverage, aggregates, total_findings }
 ```
 
 ## 6. Request decision tree (flowchart)
@@ -408,11 +408,11 @@ flowchart TD
     G --> Det
     S --> Det
 
-    Det --> Emit[emit source, findings, out]
+    Det --> Emit[emit source, typed outcome, out]
     Emit --> SevMin{Severity::from_min<br/>valid?}
     SevMin -->|no| Err1[exit 1 — anyhow context]
     SevMin -->|yes| Filter[filter_by_min_severity]
-    Filter --> Build[safe Report::from_findings<br/>no recoverable raw field<br/>BTreeMap fingerprint dedupe<br/>location, line collapse]
+    Filter --> Build[safe Report::from_outcome<br/>preserve typed coverage<br/>no recoverable raw field<br/>BTreeMap fingerprint dedupe<br/>location, line collapse]
 
     Build --> Fmt{output format}
     Fmt -->|--sarif| Sarif[write_sarif<br/>safe model only<br/>fingerprint as clavenar/v1 stable id]
