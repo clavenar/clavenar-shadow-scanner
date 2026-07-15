@@ -25,7 +25,9 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
+use std::{ops::Range, sync::OnceLock};
+
+const MAX_SCANNED_LINE_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -233,7 +235,9 @@ fn build_detectors() -> Vec<Detector> {
             name: "aws_secret_access_key",
             description: "AWS secret access key (40 char b64ish near 'aws').",
             severity: Severity::Critical,
-            pattern: r(r#"(?i)aws[_\-\s]?secret[_\-\s]?access[_\-\s]?key[^"'\n]{0,20}["']?([A-Za-z0-9/+=]{40})\b"#),
+            pattern: r(
+                r#"(?i)aws[_\-\s]?secret[_\-\s]?access[_\-\s]?key[^"'\n]{0,20}["']?([A-Za-z0-9/+=]{40})\b"#,
+            ),
             min_entropy: Some(4.0),
             min_length: Some(40),
         },
@@ -249,7 +253,9 @@ fn build_detectors() -> Vec<Detector> {
             name: "azure_client_secret",
             description: "Azure AD client secret (high-entropy near AZURE_CLIENT_SECRET).",
             severity: Severity::High,
-            pattern: r(r#"(?i)azure[_\-]?client[_\-]?secret[^"'\n]{0,20}["']?([A-Za-z0-9~._\-]{34,})"#),
+            pattern: r(
+                r#"(?i)azure[_\-]?client[_\-]?secret[^"'\n]{0,20}["']?([A-Za-z0-9~._\-]{34,})"#,
+            ),
             min_entropy: Some(4.0),
             min_length: Some(34),
         },
@@ -259,7 +265,9 @@ fn build_detectors() -> Vec<Detector> {
             severity: Severity::High,
             // Modern user API tokens have no fixed prefix; anchor on the
             // 'cloudflare' / 'cf_api_token' keyword to keep precision up.
-            pattern: r(r#"(?i)(?:cloudflare|cf[_-]?api[_-]?token)[^"'\n]{0,20}["']?([A-Za-z0-9_\-]{40})\b"#),
+            pattern: r(
+                r#"(?i)(?:cloudflare|cf[_-]?api[_-]?token)[^"'\n]{0,20}["']?([A-Za-z0-9_\-]{40})\b"#,
+            ),
             min_entropy: Some(4.0),
             min_length: Some(40),
         },
@@ -306,7 +314,9 @@ fn build_detectors() -> Vec<Detector> {
             name: "slack_webhook_url",
             description: "Slack incoming webhook URL.",
             severity: Severity::High,
-            pattern: r(r"(https://hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+)"),
+            pattern: r(
+                r"(https://hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+)",
+            ),
             min_entropy: None,
             min_length: None,
         },
@@ -328,7 +338,7 @@ fn build_detectors() -> Vec<Detector> {
         },
         Detector {
             name: "private_key_pem",
-            description: "PEM-armoured private key block opener.",
+            description: "PEM-armoured private key block.",
             severity: Severity::Critical,
             pattern: r(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
             min_entropy: None,
@@ -395,7 +405,9 @@ fn build_detectors() -> Vec<Detector> {
             name: "railway_token",
             description: "Railway project / team token (UUID near 'railway').",
             severity: Severity::High,
-            pattern: r(r#"(?i)railway[^"'\n]{0,40}["']?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b"#),
+            pattern: r(
+                r#"(?i)railway[^"'\n]{0,40}["']?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b"#,
+            ),
             min_entropy: None,
             min_length: None,
         },
@@ -415,7 +427,9 @@ fn build_detectors() -> Vec<Detector> {
             // The JWT body decodes to `role:"service_role"` — we can't see
             // that without decoding, so anchor on a `supabase` identifier on
             // the same line + a JWT-shaped value to keep precision high.
-            pattern: r(r#"(?i)supabase[^"'\n]{0,40}["']?(eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})"#),
+            pattern: r(
+                r#"(?i)supabase[^"'\n]{0,40}["']?(eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})"#,
+            ),
             min_entropy: None,
             min_length: None,
         },
@@ -463,7 +477,9 @@ fn build_detectors() -> Vec<Detector> {
             // identifier ending in key/token/secret/password followed by
             // `=` or `:` or whitespace, then a quoted-or-not 24+ char
             // base64ish string.
-            pattern: r(r#"(?i)(?:api[_-]?key|access[_-]?token|secret(?:[_-]?key)?|auth[_-]?token|password|passwd|bearer)\s*[:=]\s*["']?([A-Za-z0-9+/=_\-]{24,})["']?"#),
+            pattern: r(
+                r#"(?i)(?:api[_-]?key|access[_-]?token|secret(?:[_-]?key)?|auth[_-]?token|password|passwd|bearer)\s*[:=]\s*["']?([A-Za-z0-9+/=_\-]{24,})["']?"#,
+            ),
             min_entropy: Some(4.0),
             min_length: Some(24),
         },
@@ -488,63 +504,202 @@ pub fn shannon_entropy(s: &str) -> f64 {
     h
 }
 
+#[derive(Debug)]
+struct SourceLine<'a> {
+    content: &'a str,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug)]
+struct PendingFinding<'a> {
+    detector: &'a Detector,
+    line_idx: usize,
+    span: Range<usize>,
+    context_allowed: bool,
+}
+
 /// Run every detector against `text`, yielding findings keyed by
 /// `location` + line. Locations are caller-supplied (path, repo
 /// reference, message permalink — whatever's meaningful for the source).
+///
+/// Detection and rendering are deliberately separate passes. The first pass
+/// records every accepted match as an absolute byte span. Only after all
+/// detectors finish do we normalize those spans and render context with the
+/// complete set redacted. This prevents one finding's context from exposing a
+/// second credential on the same or a neighboring line.
 pub fn scan_text(text: &str, location: &str) -> Vec<Finding> {
-    let mut out = Vec::new();
-    for (line_idx, line) in text.lines().enumerate() {
+    let lines = source_lines(text);
+    let mut pending = Vec::new();
+    for (line_idx, line) in lines.iter().enumerate() {
         // Cheap pre-filter: skip lines longer than 4 KiB to avoid
         // pathological regex backtracking on minified bundles.
-        if line.len() > 4096 {
+        if line.content.len() > MAX_SCANNED_LINE_BYTES {
             continue;
         }
         for det in detectors() {
-            for caps in det.pattern.captures_iter(line) {
+            for caps in det.pattern.captures_iter(line.content) {
                 let m = caps.get(1).or_else(|| caps.get(0));
-                let raw = match m {
-                    Some(m) => m.as_str(),
+                let matched = match m {
+                    Some(m) => m,
                     None => continue,
                 };
+                let raw = matched.as_str();
                 if let Some(min_len) = det.min_length
-                    && raw.len() < min_len {
-                        continue;
-                    }
+                    && raw.len() < min_len
+                {
+                    continue;
+                }
                 if let Some(min_h) = det.min_entropy
-                    && shannon_entropy(raw) < min_h {
-                        continue;
-                    }
+                    && shannon_entropy(raw) < min_h
+                {
+                    continue;
+                }
 
-                let context = build_context(text, line_idx, raw);
-                out.push(Finding {
-                    detector: det.name.to_string(),
-                    severity: det.severity,
-                    location: location.to_string(),
-                    line: (line_idx + 1) as u32,
-                    raw_match: raw.to_string(),
-                    context: Some(context),
+                let match_span = (line.start + matched.start())..(line.start + matched.end());
+                let (span, context_allowed) = if det.name == "private_key_pem" {
+                    expand_pem_span(text, match_span)
+                } else {
+                    (match_span, true)
+                };
+                pending.push(PendingFinding {
+                    detector: det,
+                    line_idx,
+                    span,
+                    context_allowed,
                 });
             }
         }
     }
-    out
+
+    let redaction_spans = merge_spans(pending.iter().map(|finding| finding.span.clone()));
+    pending
+        .into_iter()
+        .map(|finding| Finding {
+            detector: finding.detector.name.to_string(),
+            severity: finding.detector.severity,
+            location: location.to_string(),
+            line: (finding.line_idx + 1) as u32,
+            raw_match: text[finding.span.clone()].to_string(),
+            context: if finding.context_allowed {
+                build_context(text, &lines, finding.line_idx, &redaction_spans)
+            } else {
+                None
+            },
+        })
+        .collect()
+}
+
+fn source_lines(text: &str) -> Vec<SourceLine<'_>> {
+    let mut offset = 0;
+    text.split_inclusive('\n')
+        .map(|raw_line| {
+            let without_newline = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+            let content = without_newline
+                .strip_suffix('\r')
+                .unwrap_or(without_newline);
+            let start = offset;
+            let end = start + content.len();
+            offset += raw_line.len();
+            SourceLine {
+                content,
+                start,
+                end,
+            }
+        })
+        .collect()
+}
+
+/// Expand a PEM opener to its matching footer. An unterminated block is
+/// treated as secret through EOF so it can redact neighboring contexts, but
+/// its own context is omitted because the complete block boundary is unknown.
+fn expand_pem_span(text: &str, opener: Range<usize>) -> (Range<usize>, bool) {
+    let opener_text = &text[opener.clone()];
+    let Some(label) = opener_text
+        .strip_prefix("-----BEGIN ")
+        .and_then(|value| value.strip_suffix("-----"))
+    else {
+        return (opener, false);
+    };
+    let footer = format!("-----END {label}-----");
+    let Some(relative_end) = text[opener.end..].find(&footer) else {
+        return (opener.start..text.len(), false);
+    };
+    (
+        opener.start..(opener.end + relative_end + footer.len()),
+        true,
+    )
+}
+
+fn merge_spans(spans: impl IntoIterator<Item = Range<usize>>) -> Vec<Range<usize>> {
+    let mut spans: Vec<_> = spans.into_iter().filter(|span| !span.is_empty()).collect();
+    spans.sort_by_key(|span| (span.start, span.end));
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if let Some(previous) = merged.last_mut()
+            && span.start <= previous.end
+        {
+            previous.end = previous.end.max(span.end);
+            continue;
+        }
+        merged.push(span);
+    }
+    merged
 }
 
 /// Build a 5-line redacted context window around `line_idx` (±2 lines).
-/// The matched secret is replaced by its redacted form *in the context
-/// only*; `Finding::raw_match` keeps the original.
-fn build_context(text: &str, line_idx: usize, secret: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
+/// Every detected span in the window is redacted. Context is omitted when the
+/// window includes a line skipped by the detector size guard, because safe
+/// rendering cannot then be proven.
+fn build_context(
+    text: &str,
+    lines: &[SourceLine<'_>],
+    line_idx: usize,
+    redaction_spans: &[Range<usize>],
+) -> Option<String> {
     let lo = line_idx.saturating_sub(2);
     let hi = (line_idx + 3).min(lines.len());
+    if lines[lo..hi]
+        .iter()
+        .any(|line| line.content.len() > MAX_SCANNED_LINE_BYTES)
+    {
+        return None;
+    }
     let mut out = String::new();
-    for (i, l) in lines[lo..hi].iter().enumerate() {
+    for (i, line) in lines[lo..hi].iter().enumerate() {
         let n = lo + i + 1;
         let marker = if lo + i == line_idx { ">" } else { " " };
-        let safe = l.replace(secret, &redact(secret));
+        let safe = render_redacted_line(text, line, redaction_spans)?;
         out.push_str(&format!("{} {:>4} | {}\n", marker, n, safe));
     }
-    out
+    Some(out)
+}
+
+fn render_redacted_line(
+    text: &str,
+    line: &SourceLine<'_>,
+    redaction_spans: &[Range<usize>],
+) -> Option<String> {
+    let mut cursor = line.start;
+    let mut out = String::with_capacity(line.content.len());
+    for span in redaction_spans {
+        if span.end <= line.start {
+            continue;
+        }
+        if span.start >= line.end {
+            break;
+        }
+        let start = span.start.max(line.start);
+        let end = span.end.min(line.end);
+        if start < cursor || start > end {
+            return None;
+        }
+        out.push_str(text.get(cursor..start)?);
+        out.push_str(&redact(text.get(start..end)?));
+        cursor = end;
+    }
+    out.push_str(text.get(cursor..line.end)?);
+    Some(out)
 }
 
 #[cfg(test)]
@@ -626,7 +781,11 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
             let text = format!("token: {}_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", prefix);
             let f = scan_text(&text, "test");
             let matches: Vec<_> = f.iter().filter(|x| x.detector == "github_pat").collect();
-            assert_eq!(matches.len(), 1, "{prefix}_ must produce exactly one github_pat finding: {f:?}");
+            assert_eq!(
+                matches.len(),
+                1,
+                "{prefix}_ must produce exactly one github_pat finding: {f:?}"
+            );
         }
     }
 
@@ -658,7 +817,8 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         let plain = "let buffer = aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi;";
         let f = scan_text(plain, "test");
         assert!(
-            !f.iter().any(|x| x.detector == "generic_high_entropy_secret"),
+            !f.iter()
+                .any(|x| x.detector == "generic_high_entropy_secret"),
             "false positive: {:?}",
             f
         );
@@ -666,7 +826,8 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         let with_kw = r#"api_key="aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi""#;
         let f2 = scan_text(with_kw, "test");
         assert!(
-            f2.iter().any(|x| x.detector == "generic_high_entropy_secret"),
+            f2.iter()
+                .any(|x| x.detector == "generic_high_entropy_secret"),
             "missed real secret: {:?}",
             f2
         );
@@ -678,7 +839,10 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         // a key (repeated chars).
         let text = r#"api_key="aaaaaaaaaaaaaaaaaaaaaaaaaa""#;
         let f = scan_text(text, "test");
-        assert!(!f.iter().any(|x| x.detector == "generic_high_entropy_secret"));
+        assert!(
+            !f.iter()
+                .any(|x| x.detector == "generic_high_entropy_secret")
+        );
     }
 
     #[test]
@@ -697,70 +861,111 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         let body: String = "aB3kQ9zL2pXn7rVfG8sJ".repeat(4); // 80 chars
         let text = format!("XAI_API_KEY=xai-{body}");
         let f = scan_text(&text, "test");
-        assert!(f.iter().any(|x| x.detector == "xai_api_key"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "xai_api_key"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_groq_api_key() {
         let text = "GROQ_API_KEY=gsk_aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234567890ABCDEFGHIJ";
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "groq_api_key"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "groq_api_key"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_huggingface_token() {
         let text = "HF_TOKEN=hf_aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234";
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "huggingface_token"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "huggingface_token"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_cloudflare_api_token() {
         let text = r#"cloudflare_api_token = "aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi12345678""#;
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "cloudflare_api_token"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "cloudflare_api_token"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_digitalocean_pat() {
-        let text = "DO_TOKEN=dop_v1_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let text =
+            "DO_TOKEN=dop_v1_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "digitalocean_pat"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "digitalocean_pat"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_fly_io_token() {
         let text = "FLY_API_TOKEN=FlyV1 fm2_lJPECAAAAAAAAAAAAA+aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi";
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "fly_io_token"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "fly_io_token"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_gitlab_pat() {
         let text = "GITLAB_TOKEN=glpat-aB3kQ9zL2pXn7rVfG8sJ";
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "gitlab_pat"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "gitlab_pat"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_atlassian_api_token() {
         let text = "JIRA_TOKEN=ATATT3xFfGF0aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234567890AB";
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "atlassian_api_token"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "atlassian_api_token"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_sourcegraph_pat() {
         let text = "SRC_ACCESS_TOKEN=sgp_aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234ABCDEFG";
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "sourcegraph_pat"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "sourcegraph_pat"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_vercel_token() {
         let text = r#"vercel_token = "aB3kQ9zL2pXn7rVfG8sJ4mTu""#;
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "vercel_token"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "vercel_token"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
@@ -768,35 +973,55 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         // Netlify PATs are nfp_ + 40+ alphanum.
         let text = "NETLIFY_AUTH_TOKEN=nfp_aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi12345ABCDEFGH";
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "netlify_pat"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "netlify_pat"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_railway_token() {
         let text = r#"RAILWAY_TOKEN="abcd1234-ef56-7890-ab12-cdef34567890""#;
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "railway_token"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "railway_token"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_planetscale_password() {
         let text = "DATABASE_URL=pscale_pw_aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234ABCDEFG";
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "planetscale_password"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "planetscale_password"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_supabase_service_role_jwt() {
         let text = r#"SUPABASE_SERVICE_ROLE_KEY="eyJhbGciOiJIUzI1NiIs.eyJzdWIxMjM0NTY3.aB3kQ9zL2pXn7rVfG8sJ""#;
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "supabase_service_role_jwt"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "supabase_service_role_jwt"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_neon_postgres_url() {
         let text = "DATABASE_URL=postgresql://user:supersecretpassword@ep-blue-dawn-12345.us-east-2.aws.neon.tech/mydb?sslmode=require";
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "neon_postgres_url"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "neon_postgres_url"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
@@ -804,14 +1029,23 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         // Telegram bot tokens: <bot_id>:<exactly 35 chars>.
         let text = r#"TELEGRAM_BOT_TOKEN="123456789:AAH-aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcH""#;
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "telegram_bot_token"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "telegram_bot_token"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn detects_discord_bot_token() {
-        let text = "DISCORD_BOT_TOKEN=MTIzNDU2Nzg5MDEyMzQ1Njc4OTA.aB3kQ9.aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi";
+        let text =
+            "DISCORD_BOT_TOKEN=MTIzNDU2Nzg5MDEyMzQ1Njc4OTA.aB3kQ9.aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi";
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "discord_bot_token"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "discord_bot_token"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
@@ -819,17 +1053,138 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         // SendGrid: SG.<exactly 22>.<exactly 43>.
         let text = r#"SENDGRID_API_KEY="SG.aB3kQ9zL2pXn7rVfG8sJ4m.aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234567890A""#;
         let f = scan_text(text, "test");
-        assert!(f.iter().any(|x| x.detector == "sendgrid_api_key"), "missed: {:?}", f);
+        assert!(
+            f.iter().any(|x| x.detector == "sendgrid_api_key"),
+            "missed: {:?}",
+            f
+        );
     }
 
     #[test]
     fn context_window_redacts_secret_in_place() {
-        let text = "before\nANTHROPIC_KEY=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW\nafter";
+        let text =
+            "before\nANTHROPIC_KEY=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW\nafter";
         let f = scan_text(text, "test");
         let ctx = f[0].context.as_ref().unwrap();
         // Original secret must NOT appear in context (it should be redacted).
         assert!(!ctx.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
         // Redaction marker should appear instead.
         assert!(ctx.contains("…"));
+    }
+
+    #[test]
+    fn context_redacts_every_secret_on_the_same_line() {
+        let anthropic = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
+        let github = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let text = format!("ANTHROPIC={anthropic} GITHUB={github}");
+        let findings = scan_text(&text, "same-line");
+        assert!(findings.iter().any(|f| f.raw_match == anthropic));
+        assert!(findings.iter().any(|f| f.raw_match == github));
+        for finding in findings {
+            let context = finding.context.expect("safe context");
+            assert!(!context.contains(anthropic));
+            assert!(!context.contains(github));
+        }
+    }
+
+    #[test]
+    fn context_redacts_secrets_on_neighboring_lines() {
+        let anthropic = "sk-ant-api03-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC-aZbYcXdW";
+        let github = "ghp_DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+        let text = format!("before\nA={anthropic}\nbetween\nG={github}\nafter");
+        let findings = scan_text(&text, "neighboring-lines");
+        assert_eq!(findings.len(), 2);
+        for finding in findings {
+            let context = finding.context.expect("safe context");
+            assert!(!context.contains(anthropic));
+            assert!(!context.contains(github));
+        }
+    }
+
+    #[test]
+    fn overlapping_detector_spans_merge_before_context_rendering() {
+        let secret = "sk-aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234";
+        let text = format!("api_key=\"{secret}\"");
+        let findings = scan_text(&text, "overlap");
+        assert!(findings.iter().any(|f| f.detector == "openai_api_key"));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.detector == "generic_high_entropy_secret")
+        );
+        for finding in findings {
+            let context = finding.context.expect("safe context");
+            assert!(!context.contains(secret));
+            assert_eq!(context.matches('…').count(), 1);
+        }
+    }
+
+    #[test]
+    fn complete_pem_block_is_one_span_and_fully_redacted_from_context() {
+        let pem = concat!(
+            "-----BEGIN RSA PRIVATE KEY-----\n",
+            "MIIEpAIBAAKCAQEA7SyntheticPrivateKeyBodyLineOne\n",
+            "SyntheticPrivateKeyBodyLineTwo9xYz\n",
+            "-----END RSA PRIVATE KEY-----"
+        );
+        let findings = scan_text(pem, "private.pem");
+        let finding = findings
+            .iter()
+            .find(|f| f.detector == "private_key_pem")
+            .expect("PEM finding");
+        assert_eq!(finding.raw_match, pem);
+        let context = finding.context.as_ref().expect("bounded PEM context");
+        assert!(!context.contains("MIIEpAIBAAKCAQEA7SyntheticPrivateKeyBodyLineOne"));
+        assert!(!context.contains("SyntheticPrivateKeyBodyLineTwo9xYz"));
+        assert!(!context.contains("-----BEGIN RSA PRIVATE KEY-----"));
+    }
+
+    #[test]
+    fn unterminated_pem_omits_its_context_and_redacts_neighbor_contexts() {
+        let github = "ghp_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE";
+        let text = format!("-----BEGIN RSA PRIVATE KEY-----\nSyntheticBody\nnearby={github}\n");
+        let findings = scan_text(&text, "unterminated.pem");
+        let pem = findings
+            .iter()
+            .find(|f| f.detector == "private_key_pem")
+            .expect("PEM finding");
+        assert!(pem.context.is_none());
+        let github_finding = findings
+            .iter()
+            .find(|f| f.detector == "github_pat")
+            .expect("GitHub finding");
+        let context = github_finding.context.as_ref().expect("GitHub context");
+        assert!(!context.contains(github));
+        assert!(!context.contains("SyntheticBody"));
+    }
+
+    #[test]
+    fn unicode_prefix_keeps_absolute_spans_on_character_boundaries() {
+        let github = "ghp_FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+        let text = format!("προοίμιο\ntoken={github}\nτέλος");
+        let findings = scan_text(&text, "unicode");
+        assert_eq!(findings[0].raw_match, github);
+        let context = findings[0].context.as_ref().expect("safe context");
+        assert!(!context.contains(github));
+        assert!(context.contains("προοίμιο"));
+        assert!(context.contains("τέλος"));
+    }
+
+    #[test]
+    fn context_is_omitted_when_neighbor_line_exceeds_scan_limit() {
+        let github = "ghp_GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG";
+        let text = format!("{}\ntoken={github}", "x".repeat(MAX_SCANNED_LINE_BYTES + 1));
+        let findings = scan_text(&text, "oversized-neighbor");
+        let finding = findings
+            .iter()
+            .find(|f| f.detector == "github_pat")
+            .expect("GitHub finding");
+        assert!(finding.context.is_none());
+    }
+
+    #[test]
+    fn span_normalization_merges_overlapping_and_adjacent_ranges() {
+        let merged = merge_spans([8..12, 2..6, 5..9, 12..15, 20..21]);
+        assert_eq!(merged, vec![2..15, 20..21]);
     }
 }

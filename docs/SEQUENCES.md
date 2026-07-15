@@ -294,7 +294,12 @@ sequenceDiagram
 The detector engine is shared by all three sources. For every line
 under 4 KiB (pathological-regex guard), every detector's regex runs;
 matches that clear `min_length` and `min_entropy` (Shannon, bits per
-byte) produce a `Finding` with a ±2-line redacted context window.
+byte) are first recorded as absolute byte spans. Bounded PEM matches
+expand through their matching footer. After the complete input has been
+scanned, overlapping and adjacent spans are merged and every `Finding`
+gets a ±2-line context window rendered from that complete redaction set.
+If the window includes an unscanned oversized line, or a PEM block is
+unterminated, context is omitted rather than rendered unsafely.
 `Report::from_findings` then groups by SHA-256 fingerprint of the
 raw secret (so the same key in 12 files becomes one entry with 12
 locations), dedupes inside an aggregate by `(location, line)` to
@@ -308,6 +313,7 @@ sequenceDiagram
     participant Scan as scan_text
     participant Det as Detector (per entry in detectors())
     participant H as shannon_entropy
+    participant Span as merge_spans
     participant Ctx as build_context
     participant Rep as Report::from_findings
     participant FP as Finding::fingerprint (sha256[..8])
@@ -330,13 +336,22 @@ sequenceDiagram
                             Scan->>Scan: skip — suppresses identifiers that look pattern-shaped
                         end
                     end
-                    Scan->>Ctx: build_context(text, line_idx, raw)
-                    Ctx->>Ctx: lines[lo..hi] with secret replaced by redact(secret) inline
-                    Ctx-->>Scan: 5-line redacted window
-                    Scan->>Scan: out.push Finding { detector, severity, location, line: idx+1, raw_match, context }
+                    Scan->>Scan: pending.push exact absolute byte span
                 end
             end
         end
+    end
+    Scan->>Span: sort + merge overlapping or adjacent accepted spans
+    Span-->>Scan: complete normalized redaction set
+    loop every pending finding
+        alt bounded PEM and context window has no skipped oversized line
+            Scan->>Ctx: build_context(text, line_idx, merged spans)
+            Ctx->>Ctx: redact every span intersecting lines[lo..hi]
+            Ctx-->>Scan: 5-line redacted window
+        else safe rendering cannot be proven
+            Scan->>Scan: context = None
+        end
+        Scan->>Scan: out.push Finding { detector, severity, location, line: idx+1, raw_match, context }
     end
     Scan-->>Caller: VecFinding
 
@@ -375,7 +390,7 @@ flowchart TD
     Sub -->|github owner or owner/repo| G[sources::github::scan_owner<br/>GITHUB_TOKEN optional, 60 rph fallback<br/>orgs then users endpoint fallback<br/>rate-limit + 429 retry loop]
     Sub -->|slack --days N| S[sources::slack::scan_workspace<br/>SLACK_BOT_TOKEN required else bail<br/>cursored list_conversations + fetch_history<br/>skip archived + non-member]
 
-    L --> Det[scan_text per file<br/>line under 4 KiB<br/>regex captures<br/>min_length + min_entropy gates<br/>build_context with inline redact]
+    L --> Det[scan_text per file<br/>line under 4 KiB<br/>collect every accepted byte span<br/>expand bounded PEM blocks<br/>merge overlap + adjacency<br/>render context from complete redaction set]
     G --> Det
     S --> Det
 

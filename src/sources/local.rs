@@ -10,8 +10,8 @@
 //! `ignore`'s walker is synchronous, so we drive it via
 //! [`tokio::task::spawn_blocking`] to avoid stalling the runtime.
 
-use super::{looks_binary, MAX_FILE_BYTES};
-use crate::detector::{scan_text, Finding};
+use super::{MAX_FILE_BYTES, looks_binary};
+use crate::detector::{Finding, scan_text};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -68,12 +68,20 @@ fn gather_paths(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 async fn scan_one_file(path: &Path) -> Result<Vec<Finding>> {
-    let metadata = tokio::fs::metadata(path).await.with_context(|| format!("stat {}", path.display()))?;
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("stat {}", path.display()))?;
     if metadata.len() > MAX_FILE_BYTES {
-        tracing::debug!("skip oversized {} ({} bytes)", path.display(), metadata.len());
+        tracing::debug!(
+            "skip oversized {} ({} bytes)",
+            path.display(),
+            metadata.len()
+        );
         return Ok(Vec::new());
     }
-    let bytes = tokio::fs::read(path).await.with_context(|| format!("read {}", path.display()))?;
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
     if looks_binary(&bytes) {
         tracing::debug!("skip binary {}", path.display());
         return Ok(Vec::new());
@@ -143,10 +151,16 @@ mod tests {
         let dir = tempdir().unwrap();
         // Build a >1MiB file ending with what would otherwise be a hit.
         let mut buf = "x".repeat((MAX_FILE_BYTES + 1024) as usize);
-        buf.push_str("\nANTHROPIC_API_KEY=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW\n");
+        buf.push_str(
+            "\nANTHROPIC_API_KEY=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW\n",
+        );
         fs::write(dir.path().join("big.txt"), buf).unwrap();
         let findings = scan_directory(dir.path()).await.unwrap();
-        assert!(findings.is_empty(), "scanned an oversized file: {:?}", findings);
+        assert!(
+            findings.is_empty(),
+            "scanned an oversized file: {:?}",
+            findings
+        );
     }
 
     #[tokio::test]

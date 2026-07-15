@@ -9,6 +9,16 @@ matched secret must clear. When the regex has a capture group, group 1
 is the secret; otherwise the whole match is. `scan_text` runs every
 detector against every line under 4 KiB and yields a `Finding` per hit.
 
+Detection and context rendering are separate passes. `scan_text` first
+records the exact absolute byte span of every accepted match, expands a
+bounded PEM private key through its matching footer, sorts the spans, and
+merges overlapping or adjacent ranges. Only then does it render each
+±2-line context window, redacting every merged span that intersects the
+window. Context is omitted if the window includes an unscanned line over
+4 KiB or if a multi-line PEM block is unterminated. Explicit local
+`--unredacted` output still exposes the aggregate raw match by request;
+human, JSON, and SARIF defaults use only redacted aggregates and contexts.
+
 Severity is load-bearing. The CLI's `emit` (in
 [`src/main.rs`](../src/main.rs)) exits `2` when any surviving aggregate
 is `Critical` or `High`, and `0` otherwise — so `Medium`/`Low` findings
@@ -60,7 +70,7 @@ vendor keyword on the same line to keep precision high.
 | `slack_webhook_url` | High | `https://hooks.slack.com/services/T…/B…/…` | — | — |
 | `stripe_live_key` | Critical | `sk_live_` / `rk_live_` + ≥20 alnum | — | — |
 | `stripe_test_key` | Low | `sk_test_` / `rk_test_` + ≥20 alnum | — | — |
-| `private_key_pem` | Critical | `-----BEGIN [RSA/EC/DSA/OPENSSH/PGP ]PRIVATE KEY-----` block opener | — | — |
+| `private_key_pem` | Critical | Complete `-----BEGIN [RSA/EC/DSA/OPENSSH/PGP ]PRIVATE KEY-----` block through its matching footer | — | — |
 | `jwt_token` | Medium | `eyJ….eyJ….<sig>` base64url triple | — | — |
 | `npm_token` | High | `npm_` + 36 alnum | — | — |
 | `gitlab_pat` | High | `glpat-` + ≥20 `[A-Za-z0-9_-]` | — | — |

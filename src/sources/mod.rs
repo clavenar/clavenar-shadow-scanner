@@ -1,8 +1,8 @@
 //! Per-platform fetchers. Every source produces `(location, text)`
 //! pairs for the [`crate::detector`] engine.
 
-pub mod local;
 pub mod github;
+pub mod local;
 pub mod slack;
 
 /// Cap on individual file size, in bytes. 1 MiB covers virtually every

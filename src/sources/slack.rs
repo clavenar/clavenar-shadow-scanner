@@ -10,10 +10,10 @@
 //! a public channel."
 
 use super::USER_AGENT_VALUE;
-use crate::detector::{scan_text, Finding};
-use anyhow::{bail, Context, Result};
+use crate::detector::{Finding, scan_text};
+use anyhow::{Context, Result, bail};
 use chrono::{Duration as CDuration, Utc};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
 
 /// How far back to look by default. 14 days covers "did someone paste
@@ -50,7 +50,10 @@ impl SlackClient {
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {}", self.token)).expect("valid token"),
         );
-        h.insert(reqwest::header::USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
+        h.insert(
+            reqwest::header::USER_AGENT,
+            HeaderValue::from_static(USER_AGENT_VALUE),
+        );
         h
     }
 
@@ -69,7 +72,10 @@ impl SlackClient {
             }
             let resp: ListConversationsResponse = self.get_json(&url).await?;
             if !resp.ok {
-                bail!("slack list_conversations: {}", resp.error.unwrap_or_default());
+                bail!(
+                    "slack list_conversations: {}",
+                    resp.error.unwrap_or_default()
+                );
             }
             out.extend(resp.channels);
             match resp.response_metadata.and_then(|m| m.next_cursor) {
@@ -82,7 +88,11 @@ impl SlackClient {
 
     /// Pull message history for `channel_id` since `since_ts` (seconds
     /// since epoch). Returns messages newest-first, as Slack does.
-    pub async fn fetch_history(&self, channel_id: &str, since_ts: f64) -> Result<Vec<SlackMessage>> {
+    pub async fn fetch_history(
+        &self,
+        channel_id: &str,
+        since_ts: f64,
+    ) -> Result<Vec<SlackMessage>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
@@ -95,7 +105,11 @@ impl SlackClient {
             }
             let resp: HistoryResponse = self.get_json(&url).await?;
             if !resp.ok {
-                bail!("slack history {}: {}", channel_id, resp.error.unwrap_or_default());
+                bail!(
+                    "slack history {}: {}",
+                    channel_id,
+                    resp.error.unwrap_or_default()
+                );
             }
             out.extend(resp.messages);
             match resp.response_metadata.and_then(|m| m.next_cursor) {
@@ -193,8 +207,7 @@ struct ResponseMetadata {
 /// looking back `lookback_days` days. Skips archived channels.
 pub async fn scan_workspace(client: &SlackClient, lookback_days: i64) -> Result<Vec<Finding>> {
     let conversations = client.list_conversations().await?;
-    let since = (Utc::now() - CDuration::days(lookback_days))
-        .timestamp() as f64;
+    let since = (Utc::now() - CDuration::days(lookback_days)).timestamp() as f64;
 
     let mut findings = Vec::new();
     for conv in conversations {

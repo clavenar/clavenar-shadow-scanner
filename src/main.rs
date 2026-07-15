@@ -6,14 +6,14 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use std::io::stdout;
-use std::path::PathBuf;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use clavenar_shadow_scanner::{
     detector::Severity,
-    output::{filter_by_min_severity, Report},
+    output::{Report, filter_by_min_severity},
     sources,
 };
+use std::io::stdout;
+use std::path::PathBuf;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -134,7 +134,11 @@ async fn run_slack(days: i64, out: OutputArgs) -> Result<()> {
     emit(&format!("slack://workspace?days={}", days), findings, out)
 }
 
-fn emit(source: &str, findings: Vec<clavenar_shadow_scanner::Finding>, out: OutputArgs) -> Result<()> {
+fn emit(
+    source: &str,
+    findings: Vec<clavenar_shadow_scanner::Finding>,
+    out: OutputArgs,
+) -> Result<()> {
     let min = Severity::from_min(&out.severity_min)
         .with_context(|| format!("invalid --severity-min: {}", out.severity_min))?;
     let findings = filter_by_min_severity(findings, min);

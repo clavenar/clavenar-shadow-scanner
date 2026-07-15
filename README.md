@@ -34,7 +34,7 @@ No account, no sign-up — grab the static binary and run.
 runtime deps, no installer):
 
 ```bash
-V=0.1.0
+V=0.1.1
 curl -fsSL "https://github.com/clavenar/clavenar-shadow-scanner/releases/download/v${V}/clavenar-shadow-scanner-${V}-x86_64-linux-musl.tar.gz" \
   | tar -xz
 ./clavenar-shadow-scanner local ~
@@ -137,6 +137,12 @@ file:
 - **`--unredacted`**: secrets render in full. JSON includes `raw`.
   Human report leads with `!! UNREDACTED OUTPUT — this report contains
   live secrets. Treat it as such.`
+- Detection completes across the entire input before any context is
+  rendered. Overlapping and adjacent credential spans are merged, and
+  every detected span in each ±2-line context window is redacted.
+- Complete bounded PEM private-key blocks are treated as a single secret.
+  Context is omitted when safe rendering cannot be proven, including
+  windows with an unscanned line over 4 KiB and unterminated PEM blocks.
 - Findings dedupe by SHA-256 fingerprint of the raw secret, so the
   same key in 12 files becomes one entry with 12 locations.
 

@@ -12,7 +12,7 @@
 
 mod sarif;
 
-use crate::detector::{redact, Finding, Severity};
+use crate::detector::{Finding, Severity, redact};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -66,7 +66,11 @@ impl Report {
                 detector: f.detector.clone(),
                 severity: f.severity,
                 redacted: redact(&f.raw_match),
-                raw: if unredacted { Some(f.raw_match.clone()) } else { None },
+                raw: if unredacted {
+                    Some(f.raw_match.clone())
+                } else {
+                    None
+                },
                 locations: Vec::new(),
             });
             // If multiple detectors fire on the same secret, prefer the
@@ -176,12 +180,13 @@ impl Report {
             }
             // Show context from the first hit as a teaser.
             if let Some(first) = agg.locations.first()
-                && let Some(ctx) = &first.context {
-                    writeln!(w, "  context (first hit):")?;
-                    for ln in ctx.lines() {
-                        writeln!(w, "    {}", ln)?;
-                    }
+                && let Some(ctx) = &first.context
+            {
+                writeln!(w, "  context (first hit):")?;
+                for ln in ctx.lines() {
+                    writeln!(w, "    {}", ln)?;
                 }
+            }
             writeln!(w)?;
         }
         Ok(())
@@ -227,7 +232,13 @@ mod tests {
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
         let r = Report::from_findings(
             "test",
-            vec![finding("anthropic_api_key", Severity::Critical, key, "a", 1)],
+            vec![finding(
+                "anthropic_api_key",
+                Severity::Critical,
+                key,
+                "a",
+                1,
+            )],
             false,
         );
         let mut buf = Vec::new();
@@ -242,7 +253,13 @@ mod tests {
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
         let r = Report::from_findings(
             "test",
-            vec![finding("anthropic_api_key", Severity::Critical, key, "a", 1)],
+            vec![finding(
+                "anthropic_api_key",
+                Severity::Critical,
+                key,
+                "a",
+                1,
+            )],
             true,
         );
         let mut buf = Vec::new();

@@ -7,10 +7,10 @@
 //! Rate-limit handling: 403 with `X-RateLimit-Remaining: 0` sleeps until
 //! `X-RateLimit-Reset`; 429 backs off 30s; anything else surfaces.
 
-use super::{looks_binary, MAX_FILE_BYTES, USER_AGENT_VALUE};
-use crate::detector::{scan_text, Finding};
-use anyhow::{bail, Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use super::{MAX_FILE_BYTES, USER_AGENT_VALUE, looks_binary};
+use crate::detector::{Finding, scan_text};
+use anyhow::{Context, Result, bail};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -84,7 +84,10 @@ impl GitHubClient {
                     // `application/vnd.github.raw` returns the file body
                     // directly instead of base64-wrapped JSON.
                     let mut h = self.headers();
-                    h.insert(ACCEPT, HeaderValue::from_static("application/vnd.github.raw"));
+                    h.insert(
+                        ACCEPT,
+                        HeaderValue::from_static("application/vnd.github.raw"),
+                    );
                     h
                 })
                 .send()
@@ -111,8 +114,14 @@ impl GitHubClient {
     /// real cause behind a misleading "no findings" exit 0.
     pub async fn list_repos(&self, owner: &str) -> Result<Vec<RepoSummary>> {
         let endpoints = [
-            format!("{}/orgs/{}/repos?per_page=100&type=all", self.base_url, owner),
-            format!("{}/users/{}/repos?per_page=100&type=all", self.base_url, owner),
+            format!(
+                "{}/orgs/{}/repos?per_page=100&type=all",
+                self.base_url, owner
+            ),
+            format!(
+                "{}/users/{}/repos?per_page=100&type=all",
+                self.base_url, owner
+            ),
         ];
         let mut last_err: Option<anyhow::Error> = None;
         for ep in endpoints {
@@ -184,7 +193,13 @@ impl GitHubClient {
         self.get_json(&url).await
     }
 
-    pub async fn fetch_blob(&self, owner: &str, repo: &str, path: &str, branch: &str) -> Result<Vec<u8>> {
+    pub async fn fetch_blob(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        branch: &str,
+    ) -> Result<Vec<u8>> {
         let url = format!(
             "{}/repos/{}/{}/contents/{}?ref={}",
             self.base_url, owner, repo, path, branch
@@ -256,9 +271,10 @@ fn next_link(resp: &reqwest::Response) -> Option<String> {
         let part = part.trim();
         if part.contains(r#"rel="next""#)
             && let Some(start) = part.find('<')
-                && let Some(end) = part.find('>') {
-                    return Some(part[start + 1..end].to_string());
-                }
+            && let Some(end) = part.find('>')
+        {
+            return Some(part[start + 1..end].to_string());
+        }
     }
     None
 }
@@ -297,7 +313,9 @@ pub async fn scan_owner(
 }
 
 async fn scan_repo(client: &GitHubClient, owner: &str, repo: &RepoSummary) -> Result<Vec<Finding>> {
-    let tree = client.list_tree(owner, &repo.name, &repo.default_branch).await?;
+    let tree = client
+        .list_tree(owner, &repo.name, &repo.default_branch)
+        .await?;
     let mut out = Vec::new();
     for entry in tree {
         // Skip oversized blobs and obviously-binary paths.
@@ -307,7 +325,10 @@ async fn scan_repo(client: &GitHubClient, owner: &str, repo: &RepoSummary) -> Re
         if has_binary_extension(&entry.path) {
             continue;
         }
-        let bytes = match client.fetch_blob(owner, &repo.name, &entry.path, &repo.default_branch).await {
+        let bytes = match client
+            .fetch_blob(owner, &repo.name, &entry.path, &repo.default_branch)
+            .await
+        {
             Ok(b) => b,
             Err(e) => {
                 tracing::debug!("blob fetch {}/{}: {}", repo.full_name, entry.path, e);
@@ -317,7 +338,9 @@ async fn scan_repo(client: &GitHubClient, owner: &str, repo: &RepoSummary) -> Re
         if looks_binary(&bytes) {
             continue;
         }
-        let Ok(text) = std::str::from_utf8(&bytes) else { continue };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
         let location = format!("{}:{}@{}", repo.full_name, entry.path, repo.default_branch);
         out.extend(scan_text(text, &location));
     }
@@ -329,13 +352,10 @@ fn has_binary_extension(path: &str) -> bool {
     // file types you'd find in a typical repo.
     let lc = path.to_ascii_lowercase();
     const BIN_EXTS: &[&str] = &[
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff",
-        ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
-        ".so", ".dll", ".dylib", ".exe", ".bin", ".o", ".a", ".lib",
-        ".class", ".jar", ".war", ".ear",
-        ".woff", ".woff2", ".ttf", ".otf", ".eot",
-        ".mp3", ".mp4", ".wav", ".flac", ".ogg", ".mov", ".avi", ".mkv",
-        ".pyc", ".pyo", ".node",
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff", ".pdf", ".zip",
+        ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".so", ".dll", ".dylib", ".exe", ".bin", ".o",
+        ".a", ".lib", ".class", ".jar", ".war", ".ear", ".woff", ".woff2", ".ttf", ".otf", ".eot",
+        ".mp3", ".mp4", ".wav", ".flac", ".ogg", ".mov", ".avi", ".mkv", ".pyc", ".pyo", ".node",
     ];
     BIN_EXTS.iter().any(|ext| lc.ends_with(ext))
 }
@@ -352,5 +372,4 @@ mod tests {
         assert!(!has_binary_extension("README.md"));
         assert!(!has_binary_extension("src/main.rs"));
     }
-
 }

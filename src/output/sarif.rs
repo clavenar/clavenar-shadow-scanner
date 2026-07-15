@@ -45,8 +45,8 @@ pub(super) fn write(report: &Report, mut w: impl Write) -> std::io::Result<()> {
     for agg in &report.aggregates {
         for loc in &agg.locations {
             let mut region = serde_json::json!({ "startLine": loc.line });
-            // Context is pre-redacted in `Finding`'s build_context (see
-            // detector.rs), so it's always safe to embed verbatim.
+            // Context is rendered only after every detector span has been
+            // collected and merged (see detector.rs), so it is safe to embed.
             if let Some(ctx) = &loc.context {
                 region["snippet"] = serde_json::json!({ "text": ctx });
             }
@@ -133,7 +133,13 @@ mod tests {
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
         let r = Report::from_findings(
             "test",
-            vec![finding("anthropic_api_key", Severity::Critical, key, "a/.env", 7)],
+            vec![finding(
+                "anthropic_api_key",
+                Severity::Critical,
+                key,
+                "a/.env",
+                7,
+            )],
             false,
         );
         let mut buf = Vec::new();
@@ -145,7 +151,10 @@ mod tests {
             v["$schema"].as_str().unwrap().contains("sarif-2.1.0"),
             "schema URL must point at v2.1.0"
         );
-        assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "clavenar-shadow-scanner");
+        assert_eq!(
+            v["runs"][0]["tool"]["driver"]["name"],
+            "clavenar-shadow-scanner"
+        );
     }
 
     #[test]
@@ -155,7 +164,13 @@ mod tests {
         let key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
         let r = Report::from_findings(
             "test",
-            vec![finding("anthropic_api_key", Severity::Critical, key, "a/.env", 7)],
+            vec![finding(
+                "anthropic_api_key",
+                Severity::Critical,
+                key,
+                "a/.env",
+                7,
+            )],
             true,
         );
         let mut buf = Vec::new();
@@ -185,12 +200,17 @@ mod tests {
         );
         let mut buf = Vec::new();
         r.write_sarif(&mut buf).unwrap();
-        let v: serde_json::Value = serde_json::from_str(std::str::from_utf8(&buf).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&buf).unwrap()).unwrap();
         let results = v["runs"][0]["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
         let lines: Vec<u64> = results
             .iter()
-            .map(|r| r["locations"][0]["physicalLocation"]["region"]["startLine"].as_u64().unwrap())
+            .map(|r| {
+                r["locations"][0]["physicalLocation"]["region"]["startLine"]
+                    .as_u64()
+                    .unwrap()
+            })
             .collect();
         assert!(lines.contains(&7) && lines.contains(&12));
         let fp1 = results[0]["fingerprints"]["clavenar/v1"].as_str().unwrap();
@@ -212,7 +232,8 @@ mod tests {
         );
         let mut buf = Vec::new();
         r.write_sarif(&mut buf).unwrap();
-        let v: serde_json::Value = serde_json::from_str(std::str::from_utf8(&buf).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&buf).unwrap()).unwrap();
         let rules = v["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 2);
         let ids: Vec<&str> = rules.iter().map(|r| r["id"].as_str().unwrap()).collect();
@@ -224,8 +245,15 @@ mod tests {
         let r = Report::from_findings("test", vec![], false);
         let mut buf = Vec::new();
         r.write_sarif(&mut buf).unwrap();
-        let v: serde_json::Value = serde_json::from_str(std::str::from_utf8(&buf).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&buf).unwrap()).unwrap();
         assert_eq!(v["runs"][0]["results"].as_array().unwrap().len(), 0);
-        assert_eq!(v["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            v["runs"][0]["tool"]["driver"]["rules"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 }
