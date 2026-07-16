@@ -33,6 +33,9 @@ Exit codes: `0` accepted coverage and no high/critical findings · `3` total sou
 
 ## Conventions & invariants
 
+- **Formatting is an owning-CI gate.** Run `cargo fmt --all -- --check`
+  before pushing Rust changes; CI runs it before check, test, and clippy.
+
 - After adding or updating a feature, also update the relevant `MANUAL_TESTS*` file(s) when needed.
 
 - **Redacted by default.** Secrets render `<first4>…<last4>`; JSON has no `raw` field. `--unredacted` shows plaintext, adds `raw`, and the human report leads with a `!! UNREDACTED OUTPUT` banner. SARIF is **always redacted** regardless of `--unredacted`.
