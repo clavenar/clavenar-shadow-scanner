@@ -2,6 +2,7 @@
 name = "clavenar-shadow-scanner"
 version = "0.1.5"
 edition = "2024"
+authors = ["Vanteguard Labs <vanteguardlabs@gmail.com>"]
 publish = false
 license = "Apache-2.0"
 description = "Free discovery tool that scans GitHub/Slack/local-fs for unauthorized agent credentials."
