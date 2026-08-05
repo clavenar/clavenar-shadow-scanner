@@ -9,11 +9,14 @@ jobs:
   ci:
     name: cargo check / test / clippy
     runs-on: self-hosted
-    env:
-      CARGO_HOME: ${{ github.workspace }}/.ci/cargo-home-${{ github.run_id }}-${{ github.run_attempt }}-ci
-      RUSTUP_HOME: ${{ github.workspace }}/.ci/rustup-home-${{ github.run_id }}-${{ github.run_attempt }}-ci
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Prepare isolated Rust toolchain state
+        run: |
+          suffix="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo-home-$suffix" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home-$suffix" >> "$GITHUB_ENV"
 
       - name: Expose preinstalled rustup without modifying shell profiles
         run: |
@@ -50,11 +53,19 @@ jobs:
   supply-chain:
     name: cargo-deny + cyclonedx SBOM
     runs-on: self-hosted
-    env:
-      CARGO_HOME: ${{ github.workspace }}/.ci/cargo-home-${{ github.run_id }}-${{ github.run_attempt }}-supply-chain
-      RUSTUP_HOME: ${{ github.workspace }}/.ci/rustup-home-${{ github.run_id }}-${{ github.run_attempt }}-supply-chain
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          rust-version: 1.97.0
+          command: check all
+
+      - name: Prepare isolated Rust toolchain state
+        run: |
+          suffix="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo-home-$suffix" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup-home-$suffix" >> "$GITHUB_ENV"
 
       - name: Expose preinstalled rustup without modifying shell profiles
         run: |
@@ -66,10 +77,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.97.0
-
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check all
 
       # cargo-cyclonedx publishes prebuilt binaries on every release, so
       # cargo-binstall pulls one in ~3s rather than cargo-installing from
