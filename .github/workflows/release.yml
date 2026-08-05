@@ -21,11 +21,17 @@ on:
       - 'v*'
 
 permissions:
-  contents: write   # required for `gh release create`
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   release:
     runs-on: self-hosted
+    env:
+      CARGO_HOME: ${{ github.workspace }}/.ci/cargo-home-${{ github.run_id }}-${{ github.run_attempt }}-release
+      RUSTUP_HOME: ${{ github.workspace }}/.ci/rustup-home-${{ github.run_id }}-${{ github.run_attempt }}-release
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -43,16 +49,37 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.97.0
+          components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: musl-release
 
-      - name: Install musl + cross-aarch64 toolchains
+      - name: Verify source before packaging
+        run: |
+          cargo fmt --all -- --check
+          cargo check --locked --all-targets
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check all
+
+      - name: Install native release inspection tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+          sudo apt-get install -y binutils file musl-tools
+
+      - uses: cargo-bins/cargo-binstall@ead08b90bd7b2e6d81963fb9cf0b7239f66d5db4 # main
+
+      - name: Install pinned release tools
+        run: |
+          cargo binstall --force --no-confirm cross@0.2.5
+          cargo binstall --force --no-confirm cargo-cyclonedx@0.5.9
+          command -v cross
+          command -v cargo-cyclonedx
 
       - name: Build static linux-x86_64 binary
         env:
@@ -61,9 +88,16 @@ jobs:
           cargo build --release --locked --target x86_64-unknown-linux-musl
           BIN=target/x86_64-unknown-linux-musl/release/clavenar-shadow-scanner
           file "$BIN"
-          if ldd "$BIN" 2>&1 | grep -qE '=>'; then
+          if ! file "$BIN" | grep -qiE 'static|statically linked'; then
             echo "::error::x86_64 binary is not statically linked"
-            ldd "$BIN" || true
+            exit 1
+          fi
+          if readelf -l "$BIN" | grep -q 'Requesting program interpreter'; then
+            echo "::error::x86_64 binary contains a program interpreter"
+            exit 1
+          fi
+          if readelf -d "$BIN" 2>&1 | grep -q '(NEEDED)'; then
+            echo "::error::x86_64 binary has dynamic dependencies"
             exit 1
           fi
           VERSION="${{ steps.ver.outputs.version }}"
@@ -73,18 +107,44 @@ jobs:
           echo "asset_x86=$ASSET" >> "$GITHUB_ENV"
 
       - name: Build static linux-aarch64 binary
-        env:
-          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: |
-          cargo build --release --locked --target aarch64-unknown-linux-musl
+          cross build --release --locked --target aarch64-unknown-linux-musl
           BIN=target/aarch64-unknown-linux-musl/release/clavenar-shadow-scanner
           file "$BIN"
+          if ! file "$BIN" | grep -qiE 'static|statically linked'; then
+            echo "::error::aarch64 binary is not statically linked"
+            exit 1
+          fi
+          if readelf -l "$BIN" | grep -q 'Requesting program interpreter'; then
+            echo "::error::aarch64 binary contains a program interpreter"
+            exit 1
+          fi
+          if readelf -d "$BIN" 2>&1 | grep -q '(NEEDED)'; then
+            echo "::error::aarch64 binary has dynamic dependencies"
+            exit 1
+          fi
           VERSION="${{ steps.ver.outputs.version }}"
           ASSET="clavenar-shadow-scanner-${VERSION}-aarch64-linux-musl.tar.gz"
           tar -czf "$ASSET" -C "$(dirname "$BIN")" "$(basename "$BIN")"
           sha256sum "$ASSET" | tee "${ASSET}.sha256"
           echo "asset_arm=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Generate release SBOM
+        run: cargo cyclonedx --format json --describe crate
+
+      - name: Attest release artifacts
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            ${{ github.workspace }}/clavenar-shadow-scanner-*.tar.gz
+            ${{ github.workspace }}/clavenar-shadow-scanner-*.tar.gz.sha256
+            ${{ github.workspace }}/*.cdx.json
+
+      - name: Attest release SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ github.workspace }}/clavenar-shadow-scanner-*.tar.gz
+          sbom-path: ${{ github.workspace }}/clavenar-shadow-scanner.cdx.json
 
       - name: Create GitHub release
         env:
@@ -96,4 +156,5 @@ jobs:
             "$asset_x86" \
             "${asset_x86}.sha256" \
             "$asset_arm" \
-            "${asset_arm}.sha256"
+            "${asset_arm}.sha256" \
+            ./*.cdx.json

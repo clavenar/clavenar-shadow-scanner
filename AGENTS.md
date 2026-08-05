@@ -13,7 +13,8 @@ cargo build --release --locked --target x86_64-unknown-linux-musl   # release ar
 ```
 
 Release binaries are fully static musl, both arches, pinned lockfile — the
-release workflow asserts the x86_64 binary has no dynamic deps via `ldd`.
+release workflow asserts both have no interpreter or dynamic dependencies,
+attests the artifacts, and attaches a CycloneDX SBOM.
 Host-build caveat: `CARGO_TARGET_DIR=/tmp/clavenar-shadow-scanner-target` (a repo `target/` may be root-owned from prior docker builds).
 
 Run: CLI binary `clavenar-shadow-scanner` — no listener, no daemon; it scans and exits. Subcommands:
@@ -26,8 +27,8 @@ Exit codes: `0` accepted coverage and no high/critical findings · `3` total sou
 ## Layout
 - `src/main.rs` — CLI entry. clap `Cli`/`Command` enum (`Local`/`Github`/`Slack`); `OutputArgs` flattened into each subcommand so all share one output surface.
 - `src/lib.rs` — public API: re-exports detector APIs plus `ScanOutcome`, `ScanCoverage`, `SourceError`, and `SourceErrorKind`. Library consumers (tests, future SDK) call these directly; `main.rs` is a thin wrapper.
-- `src/detector.rs` — ~37 hand-written regex detectors + optional Shannon-entropy/length gates; the per-line scan engine and `Severity`.
-- `src/sources/` — per-platform fetchers, each returning the common typed outcome with findings, scanned objects/bytes, skips, structured errors, truncation, invariant partial state, and source-neutral coverage evaluation: `local.rs` (gitignore-aware walk plus root-confined `Secrets` supplement via the `ignore` crate), `github.rs` (owner/repo scan, recursive-tree truncation, rate-limit backoff), `slack.rs` (cursor-paginated workspace history; `DEFAULT_LOOKBACK_DAYS`).
+- `src/detector.rs` — 37 hand-written regex detectors + optional Shannon-entropy/length gates; overlapping windows cover long lines, `scan_text` is context-free by default, and `scan_text_with_context` is explicit opt-in.
+- `src/sources/` — per-platform fetchers, each returning the common typed outcome with findings, scanned objects/bytes, intentional exclusions and declared scope, skips, structured errors, truncation, invariant partial state, and source-neutral coverage evaluation: `local.rs` (gitignore-aware walk plus root-confined `Secrets` supplement; Linux opens use `openat2` confinement), `github.rs` (owner/repo scan, recursive-tree truncation, same-origin bounded HTTP and rate-limit backoff), `slack.rs` (same-origin bounded HTTP and cursor-paginated workspace history; `DEFAULT_LOOKBACK_DAYS`).
 - `src/output/` — `mod.rs` (`Report`, coverage evaluation, redaction, `filter_by_min_severity`), `sarif.rs` (SARIF v2.1.0 emitter with coverage and decision properties).
 - `tests/` — integration tests. `docs/SEQUENCES.md` — sequence diagrams for the five primary paths + the request decision-tree. `docs/DETECTORS.md` — detector catalog (37 rules, gates, SARIF contract); keep in sync with `build_detectors`.
 
@@ -38,7 +39,7 @@ Exit codes: `0` accepted coverage and no high/critical findings · `3` total sou
 
 - After adding or updating a feature, also update the relevant `MANUAL_TESTS*` file(s) when needed.
 
-- **Redacted by default.** Secrets render `<first4>…<last4>`; JSON has no `raw` field. `--unredacted` shows plaintext, adds `raw`, and the human report leads with a `!! UNREDACTED OUTPUT` banner. SARIF is **always redacted** regardless of `--unredacted`.
+- **Redacted and context-free by default.** Secrets render `<first4>…<last4>`; JSON has no `raw` field and default scans omit neighboring source. `scan_text_with_context` is an explicit best-effort library opt-in. `--unredacted` shows plaintext, adds `raw`, and the human report leads with a `!! UNREDACTED OUTPUT` banner. SARIF is **always redacted** regardless of `--unredacted`.
 - **Secrets mode stays root-confined.** The ignored-credential supplement never follows symlinks, never enters VCS/dependency/build/cache internals, deduplicates the standard walk, and retains size/binary/UTF-8 guards.
 - **Findings dedupe by SHA-256 fingerprint** of the raw secret — the same key in 12 files collapses to one finding with 12 locations. SARIF emits this as a stable `fingerprints["clavenar/v1"]` so re-runs auto-resolve once the secret is removed.
 - **SARIF severity → GitHub Code Scanning:** Critical/High → `error`, Medium → `warning`, Low → `note`.

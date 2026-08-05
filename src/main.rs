@@ -13,6 +13,7 @@ use clavenar_shadow_scanner::{
 };
 use std::io::stdout;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -55,7 +56,11 @@ enum Command {
     /// Looks back `--days` days across every conversation the bot is
     /// a member of.
     Slack {
-        #[arg(long, default_value_t = sources::slack::DEFAULT_LOOKBACK_DAYS)]
+        #[arg(
+            long,
+            default_value_t = sources::slack::DEFAULT_LOOKBACK_DAYS,
+            value_parser = clap::value_parser!(i64).range(1..=sources::slack::MAX_LOOKBACK_DAYS)
+        )]
         days: i64,
         #[command(flatten)]
         out: OutputArgs,
@@ -102,13 +107,23 @@ fn parse_partial_percent(value: &str) -> std::result::Result<f64, String> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     // Default-off tracing; opt in via RUST_LOG (e.g. RUST_LOG=info).
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
+    match run().await {
+        Ok(code) => ExitCode::from(code),
+        Err(error) => {
+            eprintln!("{error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<u8> {
     let cli = Cli::parse();
     match cli.command {
         Command::Local {
@@ -126,7 +141,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_local(path: PathBuf, secrets_mode: bool, out: OutputArgs) -> Result<()> {
+async fn run_local(path: PathBuf, secrets_mode: bool, out: OutputArgs) -> Result<u8> {
     let source = format!("local:{}", path.display());
     let mode = if secrets_mode {
         sources::local::LocalScanMode::Secrets
@@ -147,9 +162,9 @@ async fn run_github(
     include_forks: bool,
     include_archived: bool,
     out: OutputArgs,
-) -> Result<()> {
+) -> Result<u8> {
     reject_remote_unredacted(&out, "github")?;
-    let client = sources::github::GitHubClient::from_env();
+    let client = sources::github::GitHubClient::from_env()?;
     let (owner, repo) = match owner_arg.split_once('/') {
         Some((o, r)) => (o.to_string(), Some(r.to_string())),
         None => (owner_arg.clone(), None),
@@ -166,7 +181,7 @@ async fn run_github(
     emit(&format!("github://{}", owner_arg), outcome, out)
 }
 
-async fn run_slack(days: i64, out: OutputArgs) -> Result<()> {
+async fn run_slack(days: i64, out: OutputArgs) -> Result<u8> {
     reject_remote_unredacted(&out, "slack")?;
     let client = sources::slack::SlackClient::from_env()?;
     let outcome = sources::slack::scan_workspace(&client, days).await?;
@@ -177,7 +192,7 @@ fn emit(
     source: &str,
     outcome: sources::ScanOutcome<clavenar_shadow_scanner::Finding>,
     out: OutputArgs,
-) -> Result<()> {
+) -> Result<u8> {
     let min = Severity::from_min(&out.severity_min)
         .with_context(|| format!("invalid --severity-min: {}", out.severity_min))?;
     let outcome = outcome.map_findings(|findings| filter_by_min_severity(findings, min));
@@ -191,7 +206,7 @@ fn emit(
         report.write_human(&mut stdout)?;
     }
     if report.coverage_evaluation.requires_failure() {
-        std::process::exit(sources::COVERAGE_FAILURE_EXIT_CODE);
+        return Ok(sources::COVERAGE_FAILURE_EXIT_CODE as u8);
     }
     // Non-zero exit if any critical/high finding so CI integration is useful.
     // Medium and low are informational. Coverage failure takes precedence.
@@ -200,16 +215,16 @@ fn emit(
         .iter()
         .any(|a| matches!(a.severity, Severity::Critical | Severity::High));
     if any_high {
-        std::process::exit(2);
+        return Ok(2);
     }
-    Ok(())
+    Ok(0)
 }
 
 fn emit_unredacted(
     source: &str,
     outcome: sources::ScanOutcome<clavenar_shadow_scanner::UnsafeFinding>,
     out: OutputArgs,
-) -> Result<()> {
+) -> Result<u8> {
     if out.sarif {
         bail!("--unredacted cannot be combined with --sarif");
     }
@@ -225,16 +240,16 @@ fn emit_unredacted(
         report.write_human(&mut stdout)?;
     }
     if report.coverage_evaluation.requires_failure() {
-        std::process::exit(sources::COVERAGE_FAILURE_EXIT_CODE);
+        return Ok(sources::COVERAGE_FAILURE_EXIT_CODE as u8);
     }
     let any_high = report
         .aggregates
         .iter()
         .any(|aggregate| matches!(aggregate.severity, Severity::Critical | Severity::High));
     if any_high {
-        std::process::exit(2);
+        return Ok(2);
     }
-    Ok(())
+    Ok(0)
 }
 
 fn reject_remote_unredacted(out: &OutputArgs, source: &str) -> Result<()> {

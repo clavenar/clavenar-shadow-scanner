@@ -21,8 +21,9 @@ pub mod output;
 pub mod sources;
 
 pub use detector::{
-    Detector, Finding, Severity, UnsafeFinding, detectors, redact, scan_text, scan_text_unredacted,
-    shannon_entropy,
+    Detector, Finding, MAX_FINDINGS_PER_TEXT, Severity, UnsafeFinding, detectors, redact,
+    scan_text, scan_text_unredacted, scan_text_unredacted_with_status, scan_text_with_context,
+    scan_text_with_context_status, scan_text_with_status, shannon_entropy,
 };
 pub use sources::local::LocalScanMode;
 pub use sources::{

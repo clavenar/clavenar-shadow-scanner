@@ -13,9 +13,9 @@
 //!
 //! ## Output safety
 //!
-//! [`Finding`] is safe by construction: it stores only a fingerprint,
-//! redacted display value, and redacted context. The default scan path drops
-//! matched plaintext before returning. Raw values exist only in the explicitly
+//! [`Finding`] is safe by construction: it stores only a fingerprint and
+//! redacted display value; default scans omit source context. The default scan
+//! path never allocates an owned plaintext match. Raw values exist only in the explicitly
 //! named [`UnsafeFinding`] returned by [`scan_text_unredacted`], which the CLI
 //! exposes for local scans only.
 //!
@@ -25,9 +25,11 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::{ops::Range, sync::OnceLock};
+use std::{collections::HashSet, ops::Range, sync::OnceLock};
 
 const MAX_SCANNED_LINE_BYTES: usize = 4096;
+const SCAN_WINDOW_OVERLAP_BYTES: usize = 512;
+pub const MAX_FINDINGS_PER_TEXT: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -74,8 +76,8 @@ pub struct Finding {
     pub fingerprint: String,
     /// Non-recoverable display form (`<first 4>…<last 4>` for long values).
     pub redacted: String,
-    /// ±2 lines of source context, with the secret already redacted in
-    /// place. Safe to display.
+    /// Optional ±2 lines of source context. Default and remote scans omit it;
+    /// callers must explicitly request best-effort redacted context.
     pub context: Option<String>,
 }
 
@@ -151,7 +153,7 @@ fn fingerprint(raw_match: &str) -> String {
     use sha2::Digest;
     hasher.update(raw_match.as_bytes());
     let digest = hasher.finalize();
-    hex::encode(&digest[..8])
+    hex::encode(digest)
 }
 
 pub fn redact(s: &str) -> String {
@@ -578,74 +580,84 @@ struct PendingFinding<'a> {
 /// `location` + line. Locations are caller-supplied (path, repo
 /// reference, message permalink — whatever's meaningful for the source).
 ///
-/// Detection and rendering are deliberately separate passes. The first pass
-/// records every accepted match as an absolute byte span. Only after all
-/// detectors finish do we normalize those spans and render context with the
-/// complete set redacted. This prevents one finding's context from exposing a
-/// second credential on the same or a neighboring line.
+/// The safe default omits context and returns at most
+/// [`MAX_FINDINGS_PER_TEXT`] entries. Use [`scan_text_with_status`] when a
+/// caller must distinguish complete detection from a capped result.
 pub fn scan_text(text: &str, location: &str) -> Vec<Finding> {
-    scan_text_unredacted(text, location)
+    scan_text_with_status(text, location).0
+}
+
+/// Safe default scan plus a flag indicating whether the per-object finding
+/// ceiling was reached. Source implementations use the flag to fail closed.
+pub fn scan_text_with_status(text: &str, location: &str) -> (Vec<Finding>, bool) {
+    let (_, pending, truncated) = collect_matches(text);
+    let findings = pending
         .into_iter()
-        .map(UnsafeFinding::into_safe)
-        .collect()
+        .map(|finding| {
+            let raw_match = &text[finding.span];
+            Finding::from_match(
+                finding.detector.name.to_string(),
+                finding.detector.severity,
+                location.to_string(),
+                (finding.line_idx + 1) as u32,
+                raw_match,
+                None,
+            )
+        })
+        .collect();
+    (findings, truncated)
+}
+
+/// Explicitly include nearby source after redacting every match known to the
+/// detector catalog. Default and remote scans omit context because unknown
+/// credentials in neighboring text cannot be proven safe.
+pub fn scan_text_with_context(text: &str, location: &str) -> Vec<Finding> {
+    scan_text_with_context_status(text, location).0
+}
+
+/// Explicit-context scan plus a flag indicating finding truncation.
+pub fn scan_text_with_context_status(text: &str, location: &str) -> (Vec<Finding>, bool) {
+    let (lines, pending, truncated) = collect_matches(text);
+    let redaction_spans = merge_spans(pending.iter().map(|finding| finding.span.clone()));
+    let findings = pending
+        .into_iter()
+        .map(|finding| {
+            let raw_match = &text[finding.span.clone()];
+            let context = finding
+                .context_allowed
+                .then(|| build_context(text, &lines, finding.line_idx, &redaction_spans))
+                .flatten();
+            Finding::from_match(
+                finding.detector.name.to_string(),
+                finding.detector.severity,
+                location.to_string(),
+                (finding.line_idx + 1) as u32,
+                raw_match,
+                context,
+            )
+        })
+        .collect();
+    (findings, truncated)
 }
 
 /// Scan while deliberately retaining raw matched values. Callers must keep
 /// this path local and visibly mark every output as secret-bearing.
 pub fn scan_text_unredacted(text: &str, location: &str) -> Vec<UnsafeFinding> {
-    let lines = source_lines(text);
-    let mut pending = Vec::new();
-    for (line_idx, line) in lines.iter().enumerate() {
-        // Cheap pre-filter: skip lines longer than 4 KiB to avoid
-        // pathological regex backtracking on minified bundles.
-        if line.content.len() > MAX_SCANNED_LINE_BYTES {
-            continue;
-        }
-        for det in detectors() {
-            for caps in det.pattern.captures_iter(line.content) {
-                let m = caps.get(1).or_else(|| caps.get(0));
-                let matched = match m {
-                    Some(m) => m,
-                    None => continue,
-                };
-                let raw = matched.as_str();
-                if let Some(min_len) = det.min_length
-                    && raw.len() < min_len
-                {
-                    continue;
-                }
-                if let Some(min_h) = det.min_entropy
-                    && shannon_entropy(raw) < min_h
-                {
-                    continue;
-                }
+    scan_text_unredacted_with_status(text, location).0
+}
 
-                let match_span = (line.start + matched.start())..(line.start + matched.end());
-                let (span, context_allowed) = if det.name == "private_key_pem" {
-                    expand_pem_span(text, match_span)
-                } else {
-                    (match_span, true)
-                };
-                pending.push(PendingFinding {
-                    detector: det,
-                    line_idx,
-                    span,
-                    context_allowed,
-                });
-            }
-        }
-    }
-
+/// Explicitly unsafe scan plus a flag indicating finding truncation.
+pub fn scan_text_unredacted_with_status(text: &str, location: &str) -> (Vec<UnsafeFinding>, bool) {
+    let (lines, pending, truncated) = collect_matches(text);
     let redaction_spans = merge_spans(pending.iter().map(|finding| finding.span.clone()));
-    pending
+    let findings = pending
         .into_iter()
         .map(|finding| {
             let raw_match = &text[finding.span.clone()];
-            let context = if finding.context_allowed {
-                build_context(text, &lines, finding.line_idx, &redaction_spans)
-            } else {
-                None
-            };
+            let context = finding
+                .context_allowed
+                .then(|| build_context(text, &lines, finding.line_idx, &redaction_spans))
+                .flatten();
             UnsafeFinding {
                 safe: Finding::from_match(
                     finding.detector.name.to_string(),
@@ -658,7 +670,82 @@ pub fn scan_text_unredacted(text: &str, location: &str) -> Vec<UnsafeFinding> {
                 raw_match: raw_match.to_string(),
             }
         })
-        .collect()
+        .collect();
+    (findings, truncated)
+}
+
+fn collect_matches<'a>(text: &'a str) -> (Vec<SourceLine<'a>>, Vec<PendingFinding<'a>>, bool) {
+    let lines = source_lines(text);
+    let mut pending = Vec::new();
+    let mut seen = HashSet::new();
+    let mut truncated = false;
+    'lines: for (line_idx, line) in lines.iter().enumerate() {
+        for (window_offset, window) in scan_windows(line.content) {
+            for (detector_index, det) in detectors().iter().enumerate() {
+                for caps in det.pattern.captures_iter(window) {
+                    let Some(matched) = caps.get(1).or_else(|| caps.get(0)) else {
+                        continue;
+                    };
+                    let raw = matched.as_str();
+                    if let Some(min_len) = det.min_length
+                        && raw.len() < min_len
+                    {
+                        continue;
+                    }
+                    if let Some(min_h) = det.min_entropy
+                        && shannon_entropy(raw) < min_h
+                    {
+                        continue;
+                    }
+
+                    let match_span = (line.start + window_offset + matched.start())
+                        ..(line.start + window_offset + matched.end());
+                    let (span, pem_context_allowed) = if det.name == "private_key_pem" {
+                        expand_pem_span(text, match_span)
+                    } else {
+                        (match_span, true)
+                    };
+                    if seen.insert((detector_index, span.start, span.end)) {
+                        if pending.len() == MAX_FINDINGS_PER_TEXT {
+                            truncated = true;
+                            break 'lines;
+                        }
+                        pending.push(PendingFinding {
+                            detector: det,
+                            line_idx,
+                            span,
+                            context_allowed: pem_context_allowed
+                                && line.content.len() <= MAX_SCANNED_LINE_BYTES,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    (lines, pending, truncated)
+}
+
+fn scan_windows(line: &str) -> Vec<(usize, &str)> {
+    if line.len() <= MAX_SCANNED_LINE_BYTES {
+        return vec![(0, line)];
+    }
+    let mut windows = Vec::new();
+    let mut start = 0;
+    while start < line.len() {
+        let mut end = (start + MAX_SCANNED_LINE_BYTES).min(line.len());
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        windows.push((start, &line[start..end]));
+        if end == line.len() {
+            break;
+        }
+        start = end.saturating_sub(SCAN_WINDOW_OVERLAP_BYTES);
+        while !line.is_char_boundary(start) {
+            start += 1;
+        }
+    }
+    windows
 }
 
 fn source_lines(text: &str) -> Vec<SourceLine<'_>> {
@@ -924,6 +1011,44 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         let f1 = scan_text(&t, "loc-1");
         let f2 = scan_text(&t, "loc-2");
         assert_eq!(f1[0].fingerprint(), f2[0].fingerprint());
+        assert_eq!(f1[0].fingerprint().len(), 64);
+    }
+
+    #[test]
+    fn default_scan_omits_context() {
+        let secret = "ghp_JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ";
+        let findings = scan_text(&format!("before\ntoken={secret}\nafter"), "safe-default");
+        let finding = findings
+            .iter()
+            .find(|finding| finding.detector == "github_pat")
+            .expect("GitHub finding");
+        assert!(finding.context.is_none());
+    }
+
+    #[test]
+    fn long_lines_are_scanned_in_overlapping_windows_without_duplicates() {
+        let secret = "ghp_KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK";
+        let mut text = "x".repeat(MAX_SCANNED_LINE_BYTES + 173);
+        text.push('=');
+        text.push_str(secret);
+        text.push('=');
+        text.push_str(&"y".repeat(MAX_SCANNED_LINE_BYTES));
+        let findings = scan_text(&text, "long-line");
+        let github_findings: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.detector == "github_pat")
+            .collect();
+        assert_eq!(github_findings.len(), 1);
+        assert!(github_findings[0].context.is_none());
+    }
+
+    #[test]
+    fn per_text_finding_limit_is_explicitly_reported() {
+        let secret = "ghp_NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN";
+        let text = format!("{secret} ").repeat(MAX_FINDINGS_PER_TEXT + 1);
+        let (findings, truncated) = scan_text_with_status(&text, "finding-limit");
+        assert_eq!(findings.len(), MAX_FINDINGS_PER_TEXT);
+        assert!(truncated);
     }
 
     #[test]
@@ -1135,7 +1260,7 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
     fn context_window_redacts_secret_in_place() {
         let text =
             "before\nANTHROPIC_KEY=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW\nafter";
-        let f = scan_text(text, "test");
+        let f = scan_text_with_context(text, "test");
         let ctx = f[0].context.as_ref().unwrap();
         // Original secret must NOT appear in context (it should be redacted).
         assert!(!ctx.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
@@ -1148,7 +1273,7 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         let anthropic = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-aZbYcXdW";
         let github = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let text = format!("ANTHROPIC={anthropic} GITHUB={github}");
-        let findings = scan_text(&text, "same-line");
+        let findings = scan_text_with_context(&text, "same-line");
         assert!(findings.iter().any(|f| f.detector == "anthropic_api_key"));
         assert!(findings.iter().any(|f| f.detector == "github_pat"));
         for finding in findings {
@@ -1163,7 +1288,7 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
         let anthropic = "sk-ant-api03-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC-aZbYcXdW";
         let github = "ghp_DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
         let text = format!("before\nA={anthropic}\nbetween\nG={github}\nafter");
-        let findings = scan_text(&text, "neighboring-lines");
+        let findings = scan_text_with_context(&text, "neighboring-lines");
         assert_eq!(findings.len(), 2);
         for finding in findings {
             let context = finding.context.expect("safe context");
@@ -1176,7 +1301,7 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
     fn overlapping_detector_spans_merge_before_context_rendering() {
         let secret = "sk-aB3kQ9zL2pXn7rVfG8sJ4mTuYwDeRcHi1234";
         let text = format!("api_key=\"{secret}\"");
-        let findings = scan_text(&text, "overlap");
+        let findings = scan_text_with_context(&text, "overlap");
         assert!(findings.iter().any(|f| f.detector == "openai_api_key"));
         assert!(
             findings
@@ -1218,7 +1343,7 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
     fn unterminated_pem_omits_its_context_and_redacts_neighbor_contexts() {
         let github = "ghp_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE";
         let text = format!("-----BEGIN RSA PRIVATE KEY-----\nSyntheticBody\nnearby={github}\n");
-        let findings = scan_text(&text, "unterminated.pem");
+        let findings = scan_text_with_context(&text, "unterminated.pem");
         let pem = findings
             .iter()
             .find(|f| f.detector == "private_key_pem")
@@ -1249,7 +1374,7 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
     fn context_is_omitted_when_neighbor_line_exceeds_scan_limit() {
         let github = "ghp_GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG";
         let text = format!("{}\ntoken={github}", "x".repeat(MAX_SCANNED_LINE_BYTES + 1));
-        let findings = scan_text(&text, "oversized-neighbor");
+        let findings = scan_text_with_context(&text, "oversized-neighbor");
         let finding = findings
             .iter()
             .find(|f| f.detector == "github_pat")
@@ -1288,5 +1413,22 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
             .expect("GitHub finding");
         assert_eq!(finding.raw_secret(), secret);
         assert!(!format!("{finding:?}").contains(secret));
+    }
+
+    #[test]
+    fn detector_catalog_names_stay_in_sync() {
+        let catalog = include_str!("../docs/DETECTORS.md");
+        assert_eq!(
+            detectors().len(),
+            37,
+            "update the documented detector count"
+        );
+        for detector in detectors() {
+            assert!(
+                catalog.contains(&format!("`{}`", detector.name)),
+                "detector {} is missing from docs/DETECTORS.md",
+                detector.name
+            );
+        }
     }
 }

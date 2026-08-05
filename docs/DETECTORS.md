@@ -7,24 +7,32 @@ severity, pattern, min_entropy, min_length }`: a regex over a single
 line, plus optional Shannon-entropy (bits/byte) and length floors the
 matched secret must clear. When the regex has a capture group, group 1
 is the secret; otherwise the whole match is. `scan_text` runs every
-detector against every line under 4 KiB and yields a `Finding` per hit.
+detector against every line and yields a `Finding` per hit. Lines over 4 KiB
+are covered by overlapping, UTF-8-safe windows so a single generated line
+cannot hide a credential at an arbitrary offset. Per-object findings are
+capped; source scans turn a cap hit into truncated coverage, and library
+callers can use the `*_with_status` APIs to observe it directly.
 
 The default `Finding` is safe by construction: it contains detector metadata,
 location and line, a stable fingerprint, a redacted display value, and safe
-context, but no recoverable raw credential. The default `Report` accepts only
-that type. Explicit local `--unredacted` scans use separate `UnsafeFinding` and
+optional context, but no recoverable raw credential. The default `scan_text`
+and every remote source omit context because catalog-based redaction cannot
+prove that an unknown neighboring credential is safe. Library callers can
+explicitly opt into best-effort redacted context with
+`scan_text_with_context`. The default `Report` accepts only the safe type.
+Explicit local `--unredacted` scans use separate `UnsafeFinding` and
 `UnsafeReport` types; their debug representation stays redacted, unsafe JSON is
 prominently marked, remote sources reject the flag before access, and SARIF has
 no unsafe writer.
 
-Detection and context rendering are separate passes. `scan_text` first
+Detection and opt-in context rendering are separate passes. The engine first
 records the exact absolute byte span of every accepted match, expands a
 bounded PEM private key through its matching footer, sorts the spans, and
-merges overlapping or adjacent ranges. Only then does it render each
+merges overlapping or adjacent ranges. `scan_text_with_context` then renders each
 ±2-line context window, redacting every merged span that intersects the
-window. Context is omitted if the window includes an unscanned line over
-4 KiB or if a multi-line PEM block is unterminated. Human, JSON, and SARIF
-defaults use only the raw-free safe model.
+window. Context is omitted if the window includes a line over 4 KiB or if a
+multi-line PEM block is unterminated. Human, JSON, and SARIF defaults use only
+the raw-free, context-free safe model.
 
 Severity is load-bearing. The CLI's `emit` (in
 [`src/main.rs`](../src/main.rs)) first evaluates source coverage, exiting `3`
@@ -146,9 +154,12 @@ source access.
   Scanning expects one annotation per `file:line`, and `result.locations`
   is reserved for related call-sites of the *same* finding, not the same
   secret in a different file.
+- **Artifact paths.** Local locations are root-relative. GitHub display
+  locations retain repository and branch metadata, while SARIF maps them back
+  to percent-encoded repository paths for portable file annotations.
 - **Fingerprints.** Each result carries
   `fingerprints["clavenar/v1"]` — the SHA-256 of the raw secret
-  truncated to 16 hex chars (`Finding::fingerprint`) — so re-runs
+  encoded as all 64 hexadecimal characters (`Finding::fingerprint`) — so re-runs
   auto-resolve a finding once the secret is removed.
 - **Severity mapping.** `severity_to_sarif_level` collapses the
   four-tier severity onto SARIF's three levels: `Critical`/`High` →

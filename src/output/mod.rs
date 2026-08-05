@@ -12,6 +12,7 @@ mod sarif;
 use crate::detector::{Finding, Severity, UnsafeFinding};
 use crate::sources::{CoverageEvaluation, DEFAULT_MAX_PARTIAL_PERCENT, ScanCoverage, ScanOutcome};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -127,8 +128,8 @@ impl Report {
     }
 
     pub fn write_json(&self, mut w: impl Write) -> std::io::Result<()> {
-        let s = serde_json::to_string_pretty(self).expect("Report always serializes");
-        writeln!(w, "{}", s)
+        serde_json::to_writer_pretty(&mut w, self).map_err(std::io::Error::other)?;
+        writeln!(w)
     }
 
     /// Write the report as SARIF v2.1.0. The accepted model has no raw value.
@@ -140,7 +141,7 @@ impl Report {
         writeln!(
             w,
             "clavenar-shadow-scanner :: source={}  scanned_at={}",
-            self.source,
+            terminal_safe(&self.source),
             self.scanned_at.to_rfc3339()
         )?;
         writeln!(
@@ -171,7 +172,7 @@ impl Report {
             // readable; full locations live in the JSON.
             let cap = 5;
             for loc in agg.locations.iter().take(cap) {
-                writeln!(w, "    - {}:{}", loc.location, loc.line)?;
+                writeln!(w, "    - {}:{}", terminal_safe(&loc.location), loc.line)?;
             }
             if agg.locations.len() > cap {
                 writeln!(
@@ -186,7 +187,7 @@ impl Report {
             {
                 writeln!(w, "  context (first hit):")?;
                 for ln in ctx.lines() {
-                    writeln!(w, "    {}", ln)?;
+                    writeln!(w, "    {}", terminal_safe(ln))?;
                 }
             }
             writeln!(w)?;
@@ -277,9 +278,8 @@ impl UnsafeReport {
     }
 
     pub fn write_json(&self, mut w: impl Write) -> std::io::Result<()> {
-        let serialized =
-            serde_json::to_string_pretty(self).expect("UnsafeReport always serializes");
-        writeln!(w, "{serialized}")
+        serde_json::to_writer_pretty(&mut w, self).map_err(std::io::Error::other)?;
+        writeln!(w)
     }
 
     pub fn write_human(&self, mut w: impl Write) -> std::io::Result<()> {
@@ -288,7 +288,7 @@ impl UnsafeReport {
         writeln!(
             w,
             "clavenar-shadow-scanner :: source={}  scanned_at={}",
-            self.source,
+            terminal_safe(&self.source),
             self.scanned_at.to_rfc3339()
         )?;
         writeln!(
@@ -317,7 +317,12 @@ impl UnsafeReport {
             writeln!(w, "  found in {} location(s):", aggregate.locations.len())?;
             let cap = 5;
             for location in aggregate.locations.iter().take(cap) {
-                writeln!(w, "    - {}:{}", location.location, location.line)?;
+                writeln!(
+                    w,
+                    "    - {}:{}",
+                    terminal_safe(&location.location),
+                    location.line
+                )?;
             }
             if aggregate.locations.len() > cap {
                 writeln!(
@@ -331,7 +336,7 @@ impl UnsafeReport {
             {
                 writeln!(w, "  context (first hit):")?;
                 for line in context.lines() {
-                    writeln!(w, "    {line}")?;
+                    writeln!(w, "    {}", terminal_safe(line))?;
                 }
             }
             writeln!(w)?;
@@ -359,14 +364,27 @@ fn write_human_coverage(
     }
     writeln!(
         w,
-        "coverage: scanned={} object(s)/{} byte(s)  skipped={}  errors={}  truncated={}  partial={}",
+        "coverage: scanned={} object(s)/{} byte(s)  skipped={}  excluded={}  errors={}  truncated={}  partial={}",
         coverage.objects_scanned(),
         coverage.bytes_scanned(),
         coverage.objects_skipped(),
+        coverage.objects_excluded(),
         coverage.source_errors().len(),
         coverage.truncated(),
         coverage.partial()
     )?;
+    if !coverage.scope().is_empty() {
+        writeln!(w, "scope: {}", terminal_safe(&coverage.scope().join(", ")))?;
+    }
+    if !coverage.exclusion_reasons().is_empty() {
+        let reasons = coverage
+            .exclusion_reasons()
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(w, "exclusions: {}", terminal_safe(&reasons))?;
+    }
     writeln!(
         w,
         "coverage policy: status={} incomplete={}/{} ({:.2}%) max={:.2}% recommended_exit={}",
@@ -380,7 +398,13 @@ fn write_human_coverage(
     if !coverage.source_errors().is_empty() {
         writeln!(w, "source errors:")?;
         for error in coverage.source_errors().iter().take(5) {
-            writeln!(w, "  - {:?} {}: {}", error.kind, error.item, error.message)?;
+            writeln!(
+                w,
+                "  - {:?} {}: {}",
+                error.kind,
+                terminal_safe(&error.item),
+                terminal_safe(&error.message)
+            )?;
         }
         if coverage.source_errors().len() > 5 {
             writeln!(
@@ -391,6 +415,24 @@ fn write_human_coverage(
         }
     }
     Ok(())
+}
+
+fn terminal_safe(value: &str) -> Cow<'_, str> {
+    if !value.chars().any(char::is_control) {
+        return Cow::Borrowed(value);
+    }
+    Cow::Owned(
+        value
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    '�'
+                } else {
+                    character
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Filter findings by minimum severity. `Severity::Critical` is the
@@ -483,7 +525,7 @@ mod tests {
         report.write_human(&mut human).unwrap();
         let human = String::from_utf8(human).unwrap();
         assert!(human.contains("scanned=1 object(s)/17 byte(s)"));
-        assert!(human.contains("skipped=1  errors=1"));
+        assert!(human.contains("skipped=1  excluded=0  errors=1"));
         assert!(human.contains("truncated=true  partial=true"));
         assert!(human.contains("!! PARTIAL COVERAGE"));
         assert!(human.contains("status=truncated"));
@@ -554,6 +596,24 @@ mod tests {
         let kept = filter_by_min_severity(inputs, Severity::High);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].detector, "anthropic_api_key");
+    }
+
+    #[test]
+    fn human_output_neutralizes_terminal_control_characters() {
+        let finding = finding(
+            "github_pat",
+            Severity::Critical,
+            "ghp_MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM",
+            "repo/\u{1b}[31mfile",
+            1,
+        );
+        let report = Report::from_findings("source\nspoofed", vec![finding]);
+        let mut output = Vec::new();
+        report.write_human(&mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains('\u{1b}'));
+        assert!(!output.contains("source\nspoofed"));
+        assert!(output.contains("source�spoofed"));
     }
 
     #[test]

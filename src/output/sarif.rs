@@ -44,6 +44,7 @@ pub(super) fn write(report: &Report, mut w: impl Write) -> std::io::Result<()> {
     let mut results: Vec<serde_json::Value> = Vec::new();
     for agg in &report.aggregates {
         for loc in &agg.locations {
+            let artifact_uri = artifact_uri(&report.source, &loc.location);
             let mut region = serde_json::json!({ "startLine": loc.line });
             // Context is rendered only after every detector span has been
             // collected and merged (see detector.rs), so it is safe to embed.
@@ -61,7 +62,7 @@ pub(super) fn write(report: &Report, mut w: impl Write) -> std::io::Result<()> {
                 },
                 "locations": [{
                     "physicalLocation": {
-                        "artifactLocation": { "uri": loc.location },
+                        "artifactLocation": { "uri": artifact_uri },
                         "region": region,
                     }
                 }],
@@ -98,8 +99,38 @@ pub(super) fn write(report: &Report, mut w: impl Write) -> std::io::Result<()> {
             "results": results,
         }],
     });
-    let s = serde_json::to_string_pretty(&doc).expect("SARIF document always serializes");
-    writeln!(w, "{}", s)
+    serde_json::to_writer_pretty(&mut w, &doc).map_err(std::io::Error::other)?;
+    writeln!(w)
+}
+
+fn artifact_uri(source: &str, location: &str) -> String {
+    let location = if source.starts_with("github://") {
+        location
+            .split_once(':')
+            .and_then(|(_, path_and_branch)| path_and_branch.rsplit_once('@'))
+            .map(|(path, _)| path)
+            .unwrap_or(location)
+    } else {
+        location
+    };
+    percent_encode_uri_reference(location)
+}
+
+fn percent_encode_uri_reference(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/' | b':' | b'@')
+        {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
 }
 
 /// Map our internal severity onto SARIF's three-level system.
@@ -210,6 +241,28 @@ mod tests {
         let fp2 = results[1]["fingerprints"]["clavenar/v1"].as_str().unwrap();
         assert_eq!(fp1, fp2);
         assert_eq!(results[0]["ruleId"], "anthropic_api_key");
+    }
+
+    #[test]
+    fn sarif_maps_github_locations_to_encoded_repository_paths() {
+        let report = Report::from_findings(
+            "github://owner/repo",
+            vec![finding(
+                "github_pat",
+                Severity::Critical,
+                "ghp_PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+                "owner/repo:src/a file.rs@main",
+                9,
+            )],
+        );
+        let mut output = Vec::new();
+        report.write_sarif(&mut output).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            value["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
+                ["uri"],
+            "src/a%20file.rs"
+        );
     }
 
     #[test]

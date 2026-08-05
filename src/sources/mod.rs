@@ -2,6 +2,7 @@
 //! [`crate::detector`] engine and returns the common typed coverage outcome.
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use std::collections::BTreeMap;
 
 pub mod github;
 pub mod local;
@@ -125,8 +126,8 @@ impl SourceError {
     pub fn new(kind: SourceErrorKind, item: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             kind,
-            item: item.into(),
-            message: message.into(),
+            item: truncate_metadata(item.into(), MAX_SOURCE_ITEM_BYTES),
+            message: truncate_metadata(message.into(), MAX_SOURCE_MESSAGE_BYTES),
         }
     }
 }
@@ -141,6 +142,9 @@ pub struct ScanCoverage {
     objects_scanned: u64,
     bytes_scanned: u64,
     objects_skipped: u64,
+    objects_excluded: u64,
+    exclusion_reasons: BTreeMap<String, u64>,
+    scope: Vec<String>,
     source_errors: Vec<SourceError>,
     truncated: bool,
     partial: bool,
@@ -154,6 +158,12 @@ struct ScanCoverageWire {
     bytes_scanned: u64,
     #[serde(default)]
     objects_skipped: u64,
+    #[serde(default)]
+    objects_excluded: u64,
+    #[serde(default)]
+    exclusion_reasons: BTreeMap<String, u64>,
+    #[serde(default)]
+    scope: Vec<String>,
     #[serde(default)]
     source_errors: Vec<SourceError>,
     #[serde(default)]
@@ -175,10 +185,22 @@ impl<'de> Deserialize<'de> for ScanCoverage {
                 "coverage partial state disagrees with skips, errors, or truncation",
             ));
         }
+        let excluded_total = wire
+            .exclusion_reasons
+            .values()
+            .fold(0_u64, |total, count| total.saturating_add(*count));
+        if excluded_total != wire.objects_excluded {
+            return Err(D::Error::custom(
+                "coverage exclusion count disagrees with exclusion reasons",
+            ));
+        }
         Ok(Self {
             objects_scanned: wire.objects_scanned,
             bytes_scanned: wire.bytes_scanned,
             objects_skipped: wire.objects_skipped,
+            objects_excluded: wire.objects_excluded,
+            exclusion_reasons: wire.exclusion_reasons,
+            scope: wire.scope,
             source_errors: wire.source_errors,
             truncated: wire.truncated,
             partial: wire.partial,
@@ -197,6 +219,18 @@ impl ScanCoverage {
 
     pub fn objects_skipped(&self) -> u64 {
         self.objects_skipped
+    }
+
+    pub fn objects_excluded(&self) -> u64 {
+        self.objects_excluded
+    }
+
+    pub fn exclusion_reasons(&self) -> &BTreeMap<String, u64> {
+        &self.exclusion_reasons
+    }
+
+    pub fn scope(&self) -> &[String] {
+        &self.scope
     }
 
     pub fn source_errors(&self) -> &[SourceError] {
@@ -221,8 +255,31 @@ impl ScanCoverage {
         self.partial = true;
     }
 
+    fn record_excluded(&mut self, reason: impl Into<String>) {
+        self.objects_excluded = self.objects_excluded.saturating_add(1);
+        let mut reason = truncate_metadata(reason.into(), MAX_SOURCE_ITEM_BYTES);
+        if self.exclusion_reasons.len() >= MAX_EXCLUSION_REASONS.saturating_sub(1)
+            && !self.exclusion_reasons.contains_key(&reason)
+        {
+            reason = "other".to_string();
+        }
+        let count = self.exclusion_reasons.entry(reason).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    fn record_scope(&mut self, scope: impl Into<String>) {
+        let scope = truncate_metadata(scope.into(), MAX_SOURCE_ITEM_BYTES);
+        if self.scope.len() < MAX_SCOPE_ENTRIES && !self.scope.contains(&scope) {
+            self.scope.push(scope);
+        }
+    }
+
     fn record_error(&mut self, error: SourceError) {
-        self.source_errors.push(error);
+        if self.source_errors.len() < MAX_SOURCE_ERRORS {
+            self.source_errors.push(error);
+        } else {
+            self.truncated = true;
+        }
         self.partial = true;
     }
 
@@ -235,7 +292,22 @@ impl ScanCoverage {
         self.objects_scanned = self.objects_scanned.saturating_add(other.objects_scanned);
         self.bytes_scanned = self.bytes_scanned.saturating_add(other.bytes_scanned);
         self.objects_skipped = self.objects_skipped.saturating_add(other.objects_skipped);
-        self.source_errors.extend(other.source_errors);
+        self.objects_excluded = self.objects_excluded.saturating_add(other.objects_excluded);
+        for (mut reason, count) in other.exclusion_reasons {
+            if self.exclusion_reasons.len() >= MAX_EXCLUSION_REASONS.saturating_sub(1)
+                && !self.exclusion_reasons.contains_key(&reason)
+            {
+                reason = "other".to_string();
+            }
+            let current = self.exclusion_reasons.entry(reason).or_default();
+            *current = current.saturating_add(count);
+        }
+        for scope in other.scope {
+            self.record_scope(scope);
+        }
+        for error in other.source_errors {
+            self.record_error(error);
+        }
         self.truncated |= other.truncated;
         self.partial |= other.partial;
     }
@@ -260,10 +332,10 @@ impl<F> Default for ScanOutcome<F> {
 
 impl<F> ScanOutcome<F> {
     pub fn from_findings(findings: Vec<F>) -> Self {
-        Self {
-            findings,
-            coverage: ScanCoverage::default(),
-        }
+        let mut outcome = Self::default();
+        let mut findings = findings;
+        outcome.append_findings(&mut findings);
+        outcome
     }
 
     pub fn coverage(&self) -> &ScanCoverage {
@@ -278,6 +350,18 @@ impl<F> ScanOutcome<F> {
         self.coverage.record_skipped();
     }
 
+    /// Record an object intentionally outside the configured scan scope.
+    /// Exclusions are observable but do not make otherwise-complete coverage
+    /// partial.
+    pub fn record_excluded(&mut self, reason: impl Into<String>) {
+        self.coverage.record_excluded(reason);
+    }
+
+    /// Describe the configured source scope in serialized coverage metadata.
+    pub fn record_scope(&mut self, scope: impl Into<String>) {
+        self.coverage.record_scope(scope);
+    }
+
     pub fn record_error(&mut self, error: SourceError) {
         self.coverage.record_error(error);
     }
@@ -287,11 +371,16 @@ impl<F> ScanOutcome<F> {
     }
 
     pub fn append_findings(&mut self, findings: &mut Vec<F>) {
+        let remaining = MAX_FINDINGS.saturating_sub(self.findings.len());
+        if findings.len() > remaining {
+            findings.truncate(remaining);
+            self.coverage.mark_truncated();
+        }
         self.findings.append(findings);
     }
 
     pub fn merge(&mut self, mut other: Self) {
-        self.findings.append(&mut other.findings);
+        self.append_findings(&mut other.findings);
         self.coverage.merge(other.coverage);
     }
 
@@ -313,7 +402,30 @@ impl<F> ScanOutcome<F> {
 /// regex time.
 pub(crate) const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
-pub(crate) const USER_AGENT_VALUE: &str = "clavenar-shadow-scanner/0.1";
+pub(crate) const MAX_REMOTE_BODY_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_SOURCE_OBJECTS: usize = 100_000;
+const MAX_FINDINGS: usize = 100_000;
+const MAX_SOURCE_ERRORS: usize = 10_000;
+const MAX_SOURCE_ITEM_BYTES: usize = 1024;
+const MAX_SOURCE_MESSAGE_BYTES: usize = 2048;
+const MAX_SCOPE_ENTRIES: usize = 32;
+const MAX_EXCLUSION_REASONS: usize = 64;
+
+pub(crate) const USER_AGENT_VALUE: &str =
+    concat!("clavenar-shadow-scanner/", env!("CARGO_PKG_VERSION"));
+
+fn truncate_metadata(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes.saturating_sub('…'.len_utf8());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push('…');
+    value
+}
 
 /// `git`-style binary detection: any NUL byte in the first 8 KiB means
 /// "treat as binary." UTF-8 can't contain NUL, so a positive hit rules
@@ -355,6 +467,26 @@ mod tests {
     }
 
     #[test]
+    fn intentional_exclusions_are_visible_but_not_partial() {
+        let mut outcome = ScanOutcome::<()>::default();
+        outcome.record_scope("github:default_branch_non_archived_non_fork");
+        outcome.record_excluded("archived_repository");
+        outcome.record_excluded("archived_repository");
+
+        assert_eq!(outcome.coverage().objects_excluded(), 2);
+        assert_eq!(
+            outcome.coverage().exclusion_reasons()["archived_repository"],
+            2
+        );
+        assert_eq!(outcome.coverage().scope().len(), 1);
+        assert!(!outcome.coverage().partial());
+        assert_eq!(
+            CoverageEvaluation::evaluate(outcome.coverage(), 0.0).status,
+            CoverageStatus::Complete
+        );
+    }
+
+    #[test]
     fn merge_preserves_findings_and_coverage() {
         let mut left = ScanOutcome::from_findings(vec![1]);
         left.record_scanned(4);
@@ -380,6 +512,27 @@ mod tests {
             r#"{"objects_scanned":0,"bytes_scanned":0,"objects_skipped":1,"source_errors":[],"truncated":false,"partial":false}"#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn deserialization_rejects_inconsistent_exclusion_totals() {
+        let result = serde_json::from_str::<ScanCoverage>(
+            r#"{"objects_scanned":0,"bytes_scanned":0,"objects_skipped":0,"objects_excluded":2,"exclusion_reasons":{"binary_file":1},"source_errors":[],"truncated":false,"partial":false}"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn source_error_metadata_is_utf8_safely_bounded() {
+        let error = SourceError::new(
+            SourceErrorKind::Read,
+            "π".repeat(MAX_SOURCE_ITEM_BYTES),
+            "λ".repeat(MAX_SOURCE_MESSAGE_BYTES),
+        );
+        assert!(error.item.len() <= MAX_SOURCE_ITEM_BYTES);
+        assert!(error.message.len() <= MAX_SOURCE_MESSAGE_BYTES);
+        assert!(error.item.ends_with('…'));
+        assert!(error.message.ends_with('…'));
     }
 
     #[test]

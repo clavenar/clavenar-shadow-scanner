@@ -34,7 +34,7 @@ No account, no sign-up — grab the static binary and run.
 runtime deps, no installer):
 
 ```bash
-V=0.1.5
+V=0.1.6
 curl -fsSL "https://github.com/clavenar/clavenar-shadow-scanner/releases/download/v${V}/clavenar-shadow-scanner-${V}-x86_64-linux-musl.tar.gz" \
   | tar -xz
 ./clavenar-shadow-scanner local ~
@@ -43,7 +43,10 @@ curl -fsSL "https://github.com/clavenar/clavenar-shadow-scanner/releases/downloa
 Swap `x86_64` for `aarch64` on ARM. A `.sha256` companion is published
 beside each tarball if you want to verify before extracting; the
 binaries come from the [release workflow](.github/workflows/release.yml)
-on every `v*` tag.
+on every `v*` tag. The workflow gates the tag with format/check/test/clippy and
+supply-chain checks, verifies both binaries have no interpreter or dynamic
+dependencies, publishes a CycloneDX SBOM, and records GitHub artifact
+attestations for the release files.
 
 **From source** (any platform with a Rust toolchain):
 
@@ -108,10 +111,14 @@ Output flags (`--unredacted` is local-only; the others are common):
 
 Every source returns the same typed `ScanOutcome`: findings plus a `coverage`
 object containing `objects_scanned`, `bytes_scanned`, `objects_skipped`,
-structured `source_errors`, `truncated`, and `partial`. Objects are readable
-text files for local scans, fetched blobs for GitHub, and non-empty messages
-for Slack. `partial` is an invariant: any skip, source error, or truncation
-sets it to `true`; inconsistent coverage JSON is rejected on deserialization.
+`objects_excluded`, `exclusion_reasons`, the declared `scope`, structured
+`source_errors`, `truncated`, and `partial`. Objects are readable text files for
+local scans, fetched blobs for GitHub, and non-empty messages for Slack.
+Intentional scope exclusions (for example binary files, archived repositories,
+or empty messages) are reported but do not make coverage partial. A skip means
+an in-scope object could not be scanned; any skip, source error, or truncation
+sets the invariant `partial=true`. Inconsistent coverage JSON is rejected on
+deserialization.
 
 Human and JSON reports show the complete coverage state. SARIF carries it at
 `runs[0].properties.coverage`. Every format also carries a source-neutral
@@ -135,8 +142,11 @@ it with ignored credential-oriented names (`.env*`, private-key/container
 suffixes, common credential files, and secret manifests). The supplemental
 walk is canonical-root confined, does not follow symlinks, excludes VCS
 internals and dependency/build/cache directories, deduplicates paths, and keeps
-the same 1 MiB, binary, and UTF-8 guards. It is broader for secrets, not an
-unbounded traversal of every ignored dependency.
+the same 1 MiB, binary, and UTF-8 guards. On Linux each candidate is opened
+relative to the root with `openat2` (`BENEATH`, no symlinks or magic links), and
+the read itself is capped so a concurrent file replacement or growth cannot
+escape the root or exhaust memory. It is broader for secrets, not an unbounded
+traversal of every ignored dependency.
 
 ### CI integration
 
@@ -152,7 +162,9 @@ SARIF severity maps to GitHub Code Scanning's three-level annotation
 system: `Critical`/`High` → `error` (red), `Medium` → `warning`
 (yellow), `Low` → `note` (blue). Each result carries a stable
 `fingerprints["clavenar/v1"]` (SHA-256 of the secret) so re-runs
-auto-resolve once the secret is removed.
+auto-resolve once the secret is removed. Local finding locations are
+root-relative, and GitHub source locations are mapped back to percent-encoded
+repository paths in SARIF so file annotations remain portable.
 
 ## Auth
 
@@ -178,7 +190,9 @@ The scanner finds secrets, so the report itself can become a secrets
 file:
 
 - **Default**: the `Finding` and `Report` models contain only fingerprint,
-  redacted display value, metadata, and safe context—no recoverable raw field.
+  redacted display value, and metadata—no recoverable raw field. Context is
+  omitted by default because detector-catalog redaction cannot prove that an
+  unknown neighboring credential is safe.
   Human, JSON, SARIF, serialization, and debug output therefore cannot recover
   matched plaintext.
 - **Local `--unredacted` only**: secrets render in full through separate,
@@ -187,14 +201,20 @@ file:
   access; SARIF conflicts with it.
   Human report leads with `!! UNREDACTED OUTPUT — this report contains
   live secrets. Treat it as such.`
-- Detection completes across the entire input before any context is
-  rendered. Overlapping and adjacent credential spans are merged, and
-  every detected span in each ±2-line context window is redacted.
+- Library callers can explicitly request best-effort context with
+  `scan_text_with_context`. Detection completes across the entire input before
+  that context is rendered; overlapping and adjacent credential spans are
+  merged, and every known span in each ±2-line window is redacted.
 - Complete bounded PEM private-key blocks are treated as a single secret.
   Context is omitted when safe rendering cannot be proven, including
-  windows with an unscanned line over 4 KiB and unterminated PEM blocks.
+  windows containing a line over 4 KiB and unterminated PEM blocks.
 - Findings dedupe by SHA-256 fingerprint of the raw secret, so the
   same key in 12 files becomes one entry with 12 locations.
+- Lines over 4 KiB are scanned in overlapping UTF-8-safe windows; the limit
+  bounds individual regex work rather than silently dropping the whole line.
+- Each object and aggregate report has a finding ceiling. Sources propagate a
+  ceiling hit as `truncated=true` and exit `3`; library callers can use the
+  `*_with_status` scan APIs to observe the same condition.
 
 ## Detection rules
 
@@ -222,8 +242,8 @@ enough for clean CI integration.
 - **Slack threads + archived channels**: out of scope for the MVP.
   The high-value find is "did anyone paste a key into a non-archived
   channel I'm a member of."
-- **GitHub Enterprise**: only `api.github.com` is wired; Enterprise
-  endpoint support is a base-URL knob.
+- **GitHub Enterprise auto-discovery**: the library supports an explicit HTTPS
+  API base URL, but the CLI does not infer an Enterprise endpoint from a host.
 - **Incremental scanning**: every invocation is a full scan. A delta
   cache (skip blobs whose SHA we've already scanned) is a follow-up.
 - **Verifiers**: no live API call to confirm the secret is active.

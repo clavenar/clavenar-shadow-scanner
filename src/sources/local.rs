@@ -10,10 +10,15 @@
 //! `ignore`'s walker is synchronous, so we drive it via
 //! [`tokio::task::spawn_blocking`] to avoid stalling the runtime.
 
-use super::{MAX_FILE_BYTES, ScanOutcome, SourceError, SourceErrorKind, looks_binary};
-use crate::detector::{Finding, UnsafeFinding, scan_text, scan_text_unredacted};
-use anyhow::{Context, Result};
+use super::{
+    MAX_FILE_BYTES, MAX_SOURCE_OBJECTS, ScanOutcome, SourceError, SourceErrorKind, looks_binary,
+};
+use crate::detector::{
+    Finding, UnsafeFinding, scan_text_unredacted_with_status, scan_text_with_status,
+};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -34,29 +39,40 @@ pub async fn scan_directory_with_mode(
     root: &Path,
     mode: LocalScanMode,
 ) -> Result<ScanOutcome<Finding>> {
-    let root = root.to_path_buf();
+    let requested_root = root.to_path_buf();
     // The `ignore` walker is synchronous. Push the whole walk onto the
     // blocking pool; we collect a `Vec<PathBuf>` first, then read +
     // scan asynchronously. Trading a small upfront allocation for a
     // simpler async story.
-    let gathered = tokio::task::spawn_blocking(move || gather_paths(&root, mode))
+    let gathered = tokio::task::spawn_blocking(move || gather_paths(&requested_root, mode))
         .await
         .context("spawn_blocking gather_paths")?;
 
     let mut outcome = ScanOutcome::default();
+    record_local_scope(&mut outcome, mode);
+    if gathered.truncated {
+        outcome.mark_truncated();
+    }
     for error in gathered.errors {
         outcome.record_error(error);
     }
+    let Some(root) = gathered.root else {
+        return Ok(outcome);
+    };
     for path in gathered.paths {
-        match scan_one_file(&path).await {
+        match scan_one_file(&root, &path).await {
             Ok(FileScan::Scanned {
                 mut findings,
                 bytes,
+                truncated,
             }) => {
                 outcome.record_scanned(bytes);
                 outcome.append_findings(&mut findings);
+                if truncated {
+                    outcome.mark_truncated();
+                }
             }
-            Ok(FileScan::Skipped) => outcome.record_skipped(),
+            Ok(FileScan::Excluded(reason)) => outcome.record_excluded(reason),
             Err(error) => {
                 tracing::warn!("skip {}: {}", path.display(), error);
                 outcome.record_error(SourceError::new(
@@ -80,25 +96,36 @@ pub async fn scan_directory_unredacted_with_mode(
     root: &Path,
     mode: LocalScanMode,
 ) -> Result<ScanOutcome<UnsafeFinding>> {
-    let root = root.to_path_buf();
-    let gathered = tokio::task::spawn_blocking(move || gather_paths(&root, mode))
+    let requested_root = root.to_path_buf();
+    let gathered = tokio::task::spawn_blocking(move || gather_paths(&requested_root, mode))
         .await
         .context("spawn_blocking gather_paths")?;
 
     let mut outcome = ScanOutcome::default();
+    record_local_scope(&mut outcome, mode);
+    if gathered.truncated {
+        outcome.mark_truncated();
+    }
     for error in gathered.errors {
         outcome.record_error(error);
     }
+    let Some(root) = gathered.root else {
+        return Ok(outcome);
+    };
     for path in gathered.paths {
-        match scan_one_file_unredacted(&path).await {
+        match scan_one_file_unredacted(&root, &path).await {
             Ok(FileScan::Scanned {
                 mut findings,
                 bytes,
+                truncated,
             }) => {
                 outcome.record_scanned(bytes);
                 outcome.append_findings(&mut findings);
+                if truncated {
+                    outcome.mark_truncated();
+                }
             }
-            Ok(FileScan::Skipped) => outcome.record_skipped(),
+            Ok(FileScan::Excluded(reason)) => outcome.record_excluded(reason),
             Err(error) => {
                 tracing::warn!("skip {}: {}", path.display(), error);
                 outcome.record_error(SourceError::new(
@@ -112,9 +139,18 @@ pub async fn scan_directory_unredacted_with_mode(
     Ok(outcome)
 }
 
+fn record_local_scope<F>(outcome: &mut ScanOutcome<F>, mode: LocalScanMode) {
+    outcome.record_scope(match mode {
+        LocalScanMode::Standard => "local:gitignore_aware_text_files",
+        LocalScanMode::Secrets => "local:gitignore_aware_plus_credential_files",
+    });
+}
+
 struct GatheredPaths {
+    root: Option<PathBuf>,
     paths: Vec<PathBuf>,
     errors: Vec<SourceError>,
+    truncated: bool,
 }
 
 fn gather_paths(root: &Path, mode: LocalScanMode) -> GatheredPaths {
@@ -122,12 +158,14 @@ fn gather_paths(root: &Path, mode: LocalScanMode) -> GatheredPaths {
         Ok(root) => root,
         Err(error) => {
             return GatheredPaths {
+                root: None,
                 paths: Vec::new(),
                 errors: vec![SourceError::new(
                     SourceErrorKind::Walk,
                     root.display().to_string(),
                     error.to_string(),
                 )],
+                truncated: false,
             };
         }
     };
@@ -137,11 +175,15 @@ fn gather_paths(root: &Path, mode: LocalScanMode) -> GatheredPaths {
         let supplemental = walk_paths(&root, false, true);
         gathered.paths.extend(supplemental.paths);
         gathered.errors.extend(supplemental.errors);
+        gathered.truncated |= supplemental.truncated;
     }
     let paths = gathered.paths.into_iter().collect::<BTreeSet<_>>();
+    let truncated = gathered.truncated || paths.len() > MAX_SOURCE_OBJECTS;
     GatheredPaths {
-        paths: paths.into_iter().collect(),
+        root: Some(root),
+        paths: paths.into_iter().take(MAX_SOURCE_OBJECTS).collect(),
         errors: gathered.errors,
+        truncated,
     }
 }
 
@@ -160,6 +202,7 @@ fn walk_paths(root: &Path, standard_filters: bool, credential_only: bool) -> Gat
 
     let mut paths = Vec::new();
     let mut errors = Vec::new();
+    let mut truncated = false;
     for dent in walker {
         let dent = match dent {
             Ok(d) => d,
@@ -193,8 +236,17 @@ fn walk_paths(root: &Path, standard_filters: bool, credential_only: bool) -> Gat
         // Defer the size + binary heuristics to scan_one_file; here we
         // just collect candidate paths.
         paths.push(path.to_path_buf());
+        if paths.len() > MAX_SOURCE_OBJECTS {
+            truncated = true;
+            break;
+        }
     }
-    GatheredPaths { paths, errors }
+    GatheredPaths {
+        root: Some(root.to_path_buf()),
+        paths,
+        errors,
+        truncated,
+    }
 }
 
 fn safe_secrets_entry(entry: &ignore::DirEntry) -> bool {
@@ -270,53 +322,136 @@ fn is_credential_path(path: &Path) -> bool {
 }
 
 enum FileScan<F> {
-    Scanned { findings: Vec<F>, bytes: usize },
-    Skipped,
+    Scanned {
+        findings: Vec<F>,
+        bytes: usize,
+        truncated: bool,
+    },
+    Excluded(&'static str),
 }
 
-async fn scan_one_file(path: &Path) -> Result<FileScan<Finding>> {
-    let Some(text) = read_scannable_file(path).await? else {
-        return Ok(FileScan::Skipped);
+async fn scan_one_file(root: &Path, path: &Path) -> Result<FileScan<Finding>> {
+    let text = match read_scannable_file(root, path).await? {
+        FileContent::Text(text) => text,
+        FileContent::Excluded(reason) => return Ok(FileScan::Excluded(reason)),
     };
+    let location = local_location(root, path);
+    let (findings, truncated) = scan_text_with_status(&text, &location);
     Ok(FileScan::Scanned {
         bytes: text.len(),
-        findings: scan_text(&text, &path.display().to_string()),
+        findings,
+        truncated,
     })
 }
 
-async fn scan_one_file_unredacted(path: &Path) -> Result<FileScan<UnsafeFinding>> {
-    let Some(text) = read_scannable_file(path).await? else {
-        return Ok(FileScan::Skipped);
+async fn scan_one_file_unredacted(root: &Path, path: &Path) -> Result<FileScan<UnsafeFinding>> {
+    let text = match read_scannable_file(root, path).await? {
+        FileContent::Text(text) => text,
+        FileContent::Excluded(reason) => return Ok(FileScan::Excluded(reason)),
     };
+    let location = local_location(root, path);
+    let (findings, truncated) = scan_text_unredacted_with_status(&text, &location);
     Ok(FileScan::Scanned {
         bytes: text.len(),
-        findings: scan_text_unredacted(&text, &path.display().to_string()),
+        findings,
+        truncated,
     })
 }
 
-async fn read_scannable_file(path: &Path) -> Result<Option<String>> {
-    let metadata = tokio::fs::metadata(path)
+fn local_location(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+enum FileContent {
+    Text(String),
+    Excluded(&'static str),
+}
+
+async fn read_scannable_file(root: &Path, path: &Path) -> Result<FileContent> {
+    let root = root.to_path_buf();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_scannable_file_sync(&root, &path))
         .await
-        .with_context(|| format!("stat {}", path.display()))?;
-    if metadata.len() > MAX_FILE_BYTES {
-        tracing::debug!(
-            "skip oversized {} ({} bytes)",
-            path.display(),
-            metadata.len()
-        );
-        return Ok(None);
+        .context("spawn_blocking read_scannable_file")?
+}
+
+fn read_scannable_file_sync(root: &Path, path: &Path) -> Result<FileContent> {
+    let mut file = open_root_confined(root, path)?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat open file {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("opened path is not a regular file: {}", path.display());
     }
-    let bytes = tokio::fs::read(path)
-        .await
+    if metadata.len() > MAX_FILE_BYTES {
+        tracing::debug!("exclude oversized {}", path.display());
+        return Ok(FileContent::Excluded("oversized_file"));
+    }
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(MAX_FILE_BYTES as usize));
+    file.by_ref()
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Ok(FileContent::Excluded("file_grew_beyond_size_limit"));
+    }
     if looks_binary(&bytes) {
-        tracing::debug!("skip binary {}", path.display());
-        return Ok(None);
+        tracing::debug!("exclude binary {}", path.display());
+        return Ok(FileContent::Excluded("binary_file"));
     }
     match String::from_utf8(bytes) {
-        Ok(text) => Ok(Some(text)),
-        Err(_) => Ok(None),
+        Ok(text) => Ok(FileContent::Text(text)),
+        Err(_) => Ok(FileContent::Excluded("non_utf8_file")),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn open_root_confined(root: &Path, path: &Path) -> Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags, open, openat2};
+
+    let relative = path
+        .strip_prefix(root)
+        .with_context(|| format!("{} is outside scan root {}", path.display(), root.display()))?;
+    if relative.as_os_str().is_empty() {
+        bail!("scan root itself is not a candidate file");
+    }
+    let root_fd = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("open scan root {}", root.display()))?;
+    let file_fd = openat2(
+        &root_fd,
+        relative,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
+    )
+    .with_context(|| format!("open root-confined {}", path.display()))?;
+    Ok(std::fs::File::from(file_fd))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_root_confined(root: &Path, path: &Path) -> Result<std::fs::File> {
+    let metadata =
+        std::fs::symlink_metadata(path).with_context(|| format!("lstat {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("refuse symlink {}", path.display());
+    }
+    let canonical =
+        std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
+    if !canonical.starts_with(root) {
+        bail!(
+            "{} resolves outside scan root {}",
+            path.display(),
+            root.display()
+        );
+    }
+    std::fs::File::open(&canonical).with_context(|| format!("open {}", canonical.display()))
 }
 
 #[cfg(test)]
@@ -397,8 +532,9 @@ mod tests {
             "scanned an oversized file: {:?}",
             outcome.findings
         );
-        assert_eq!(outcome.coverage().objects_skipped(), 1);
-        assert!(outcome.coverage().partial());
+        assert_eq!(outcome.coverage().objects_excluded(), 1);
+        assert_eq!(outcome.coverage().exclusion_reasons()["oversized_file"], 1);
+        assert!(!outcome.coverage().partial());
     }
 
     #[tokio::test]
@@ -417,8 +553,9 @@ mod tests {
             "binary file scanned: {:?}",
             outcome.findings
         );
-        assert_eq!(outcome.coverage().objects_skipped(), 1);
-        assert!(outcome.coverage().partial());
+        assert_eq!(outcome.coverage().objects_excluded(), 1);
+        assert_eq!(outcome.coverage().exclusion_reasons()["binary_file"], 1);
+        assert!(!outcome.coverage().partial());
     }
 
     #[tokio::test]
@@ -454,6 +591,30 @@ mod tests {
         }
         assert!(!is_credential_path(Path::new("README.md")));
         assert!(!is_credential_path(Path::new("src/main.rs")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confined_open_rejects_symlinks_and_paths_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("outside.env");
+        fs::write(
+            &outside_file,
+            "GITHUB_TOKEN=ghp_LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL",
+        )
+        .unwrap();
+        let link = root.path().join("linked.env");
+        symlink(&outside_file, &link).unwrap();
+
+        assert!(read_scannable_file(root.path(), &link).await.is_err());
+        assert!(
+            read_scannable_file(root.path(), &outside_file)
+                .await
+                .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -514,18 +675,14 @@ mod tests {
             .iter()
             .map(|finding| finding.location.as_str())
             .collect::<Vec<_>>();
-        assert!(locations.iter().any(|location| location.ends_with("/.env")));
-        assert!(!locations.iter().any(|location| location.contains("/.git/")));
+        assert!(locations.contains(&".env"));
+        assert!(!locations.iter().any(|location| location.contains(".git/")));
         assert!(
             !locations
                 .iter()
-                .any(|location| location.contains("/node_modules/"))
+                .any(|location| location.contains("node_modules/"))
         );
-        assert!(
-            !locations
-                .iter()
-                .any(|location| location.ends_with("/linked.env"))
-        );
+        assert!(!locations.iter().any(|location| location == &"linked.env"));
         assert_eq!(secrets.coverage().source_errors().len(), 0);
         assert!(!secrets.coverage().partial());
     }

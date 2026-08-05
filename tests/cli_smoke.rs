@@ -297,13 +297,18 @@ fn total_source_failure_exits_three_with_explicit_policy() {
     assert_eq!(report["coverage_evaluation"]["recommended_exit_code"], 3);
 }
 
+#[cfg(unix)]
 #[test]
 fn partial_threshold_is_strict_and_configurable() {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = tempfile::tempdir().unwrap();
     for index in 0..9 {
         std::fs::write(dir.path().join(format!("clean-{index}.txt")), "clean\n").unwrap();
     }
-    std::fs::write(dir.path().join("binary.bin"), b"\0binary").unwrap();
+    let unreadable = dir.path().join("unreadable.txt");
+    std::fs::write(&unreadable, "in scope but unreadable\n").unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let accepted = Command::new(cargo_bin())
         .arg("local")
@@ -335,12 +340,17 @@ fn partial_threshold_is_strict_and_configurable() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn coverage_failure_takes_precedence_over_finding_exit() {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = tempfile::tempdir().unwrap();
     let key = "sk-ant-api03-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII-iZbYcXdW";
     std::fs::write(dir.path().join("credential.env"), format!("KEY={key}\n")).unwrap();
-    std::fs::write(dir.path().join("binary.bin"), b"\0binary").unwrap();
+    let unreadable = dir.path().join("unreadable.txt");
+    std::fs::write(&unreadable, "in scope but unreadable\n").unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
     let output = Command::new(cargo_bin())
         .arg("local")
         .arg(dir.path())

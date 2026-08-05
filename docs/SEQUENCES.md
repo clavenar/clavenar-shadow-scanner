@@ -82,12 +82,12 @@ sequenceDiagram
     end
     Out-->>Op: stdout payload
     alt coverage status is threshold_exceeded, truncated, or total_failure
-        Emit-->>Op: process::exit(3) — coverage failure takes precedence
+        Emit-->>Op: return exit 3 — coverage failure takes precedence
     else accepted coverage
         Emit->>Emit: any_high = aggregates.iter().any(Critical or High)
     end
     alt accepted coverage and any_high
-        Emit-->>Op: process::exit(2)  — CI-friendly
+        Emit-->>Op: return exit 2  — CI-friendly
     else accepted coverage and no critical or high (or filtered out)
         Emit-->>Op: exit 0
     end
@@ -98,14 +98,17 @@ sequenceDiagram
 
 `scan_directory_with_mode` canonicalizes the requested root, pushes the
 synchronous `ignore::WalkBuilder` walk onto the blocking pool, deduplicates
-candidate paths, then reads + scans each file asynchronously. Standard mode
+candidate paths, then opens + scans each file on the blocking pool. Standard mode
 uses normal ignore filters while excluding VCS internals and symlinks. Secrets
 mode supplements that set with ignored credential-oriented filenames, without
-entering VCS, dependency, build, virtualenv, or cache directories. Per-file the metadata
-size cap, the NUL-byte binary heuristic, and the UTF-8 check all
-short-circuit before any regex work. Individual file failures become
+entering VCS, dependency, build, virtualenv, or cache directories. Linux opens
+are relative to the canonical root through `openat2` with `BENEATH`,
+`NO_SYMLINKS`, and `NO_MAGICLINKS`; the read itself is capped at 1 MiB + 1
+byte. The NUL-byte binary heuristic and UTF-8 check short-circuit before regex
+work. Binary, oversized, and non-UTF-8 files become visible intentional
+exclusions. Individual file failures become
 structured source errors while other readable files continue. Every scanned,
-skipped, and errored item contributes to the returned coverage state.
+excluded, skipped, and errored item contributes to the returned coverage state.
 
 ```mermaid
 sequenceDiagram
@@ -114,7 +117,7 @@ sequenceDiagram
     participant Scan as scan_directory
     participant Gather as gather_paths (spawn_blocking)
     participant Ignore as ignore::WalkBuilder
-    participant Tokio as tokio::fs
+    participant Open as root-confined blocking open/read
     participant Det as scan_text
 
     Run->>Scan: scan_directory_with_mode(root, Standard or Secrets)
@@ -137,25 +140,24 @@ sequenceDiagram
         end
     end
     Gather->>Gather: BTreeSet dedupe paths from both walks
-    Gather-->>Scan: GatheredPaths { canonical paths, errors }
+    Gather-->>Scan: GatheredPaths { canonical root, bounded paths, errors, truncated }
     deactivate Gather
     loop every collected path
-        Scan->>Scan: scan_one_file(path)
-        Scan->>Tokio: metadata(path)
-        alt metadata err
-            Tokio-->>Scan: Err
+        Scan->>Scan: scan_one_file(root, path)
+        Scan->>Open: openat2(root fd, relative path) + fstat + capped read
+        alt open/read err
+            Open-->>Scan: Err
             Scan->>Scan: record SourceError kind=read — continue
         else size > MAX_FILE_BYTES
-            Tokio-->>Scan: metadata.len() > MAX_FILE_BYTES
-            Scan->>Scan: record skipped object — return FileScan::Skipped
+            Open-->>Scan: metadata.len() > MAX_FILE_BYTES
+            Scan->>Scan: record excluded oversized_file
         end
-        Scan->>Tokio: read(path)
-        Tokio-->>Scan: bytes
+        Open-->>Scan: at most MAX_FILE_BYTES + 1 bytes
         Scan->>Scan: looks_binary (NUL-byte heuristic, same as git uses)
         alt binary
-            Scan->>Scan: record skipped object — return FileScan::Skipped
+            Scan->>Scan: record excluded binary_file
         end
-        Scan->>Scan: std::str::from_utf8(&bytes) — not UTF-8 → record skipped object
+        Scan->>Scan: std::str::from_utf8(&bytes) — not UTF-8 → record exclusion
         Scan->>Det: scan_text(text, path.display.to_string)
         Det-->>Scan: VecFinding
         Scan->>Scan: record scanned object/bytes + append findings
@@ -168,10 +170,11 @@ sequenceDiagram
 `GitHubClient::from_env` pulls an optional `GITHUB_TOKEN` (unset
 falls back to the 60-req/hour public ceiling). `scan_owner` either
 fetches one named repo or paginates `/orgs/{owner}/repos` →
-`/users/{owner}/repos` (whichever returns non-empty wins; both
-errors become typed repository coverage records). Every HTTP call goes through a
-retry-on-rate-limit loop that respects `X-RateLimit-Reset` and
-sleeps on 429 with a 30s backoff.
+`/users/{owner}/repos` (the user fallback runs only when the organization
+endpoint returns 404; an empty organization stays empty). Every URL component
+is percent encoded, pagination must remain on the configured HTTPS origin,
+redirects are disabled, response bodies/pages are bounded, and rate-limit
+retries have a fixed attempt ceiling.
 
 ```mermaid
 sequenceDiagram
@@ -194,7 +197,11 @@ sequenceDiagram
         Gh-->>Scan: RepoSummary
     else
         Scan->>List: list_repos(owner)
-        loop endpoints [/orgs/{owner}/repos, /users/{owner}/repos]
+        List->>List: request /orgs/{owner}/repos
+        alt organization endpoint returns 404
+            List->>List: request /users/{owner}/repos
+        end
+        loop bounded same-origin Link rel=next pages
             List->>List: paginate_repos(url)
             loop while next Link rel=next
                 List->>Gh: GET url + Bearer GITHUB_TOKEN + Accept: application/vnd.github+json
@@ -205,24 +212,21 @@ sequenceDiagram
                     Gh-->>List: 429
                     List->>List: sleep 30s — retry
                 else non-2xx
-                    Gh-->>List: status + body
+                    Gh-->>List: status; bounded body omitted from errors
                     List-->>Scan: source error
                 else 2xx
                     Gh-->>List: page JSON + Link header
                     List->>List: parse next_link — all.extend(page)
                 end
             end
-            List-->>Scan: VecRepoSummary (or last_err carried forward)
-            alt non-empty
-                Scan->>Scan: use this list, stop iterating endpoints
-            end
+            List-->>Scan: bounded VecRepoSummary
         end
     end
     loop every repo
         alt !include_forks AND repo.fork
-            Scan->>Scan: record skipped repo
+            Scan->>Scan: record excluded fork_repository
         else !include_archived AND repo.archived
-            Scan->>Scan: record skipped repo
+            Scan->>Scan: record excluded archived_repository
         else
             Scan->>Tree: list_tree(owner, repo.name, repo.default_branch)
             Tree->>Gh: GET /repos/.../git/trees/{branch}?recursive=1
@@ -233,13 +237,13 @@ sequenceDiagram
             end
             loop every blob
                 alt size > MAX_FILE_BYTES OR has_binary_extension(path)
-                    Scan->>Scan: record skipped blob
+                    Scan->>Scan: record intentional blob exclusion
                 else
                     Scan->>Blob: fetch_blob(owner, repo, path, branch)
                     Blob->>Gh: GET /repos/.../contents/{path}?ref={branch} + Accept: application/vnd.github.raw
                     Gh-->>Blob: raw bytes (rate-limit-loop applies)
                     Blob-->>Scan: bytes
-                    Scan->>Scan: looks_binary OR utf8 decode fail → record skipped blob
+                    Scan->>Scan: looks_binary OR utf8 decode fail → record exclusion
                     Scan->>Det: scan_text(text, "{owner}/{repo}:{path}@{branch}")
                     Det-->>Scan: VecFinding
                     Scan->>Scan: record scanned object/bytes + extend findings
@@ -256,10 +260,13 @@ sequenceDiagram
 boot if unset — required scopes documented in
 `src/sources/slack.rs`). `scan_workspace` lists every conversation
 the bot is a member of (cursor-paginated), skips archived /
-non-member rooms, then pages `conversations.history` for each
+non-member/external-shared rooms, then pages `conversations.history` for each
 remaining channel back to `now - lookback_days`. Slack returns
 `{ ok: false, error }` with a 200 status, so every paged response is
-parsed and the `ok` flag inspected before consuming `messages`.
+parsed and the `ok` flag inspected before consuming `messages`. The lookback is
+restricted to 1–3650 days; redirects are disabled, URLs stay on the configured
+HTTPS origin, and response bodies, pagination, cursors, retries, messages, and
+aggregate findings all have explicit ceilings.
 
 ```mermaid
 sequenceDiagram
@@ -288,8 +295,8 @@ sequenceDiagram
     Conv-->>Scan: VecConversation
     Scan->>Scan: since_ts = Utc::now - Duration::days(lookback_days)
     loop every conversation
-        alt conv.is_archived OR !conv.is_member
-            Scan->>Scan: record skipped conversation
+        alt archived, non-member, or external-shared
+            Scan->>Scan: record intentional conversation exclusion
         else
             Scan->>Hist: fetch_history(channel_id, since_ts)
             loop until next_cursor empty
@@ -304,7 +311,7 @@ sequenceDiagram
             Hist-->>Scan: VecSlackMessage
             loop every message
                 alt msg.text.is_empty
-                    Scan->>Scan: record skipped message
+                    Scan->>Scan: record excluded empty_message
                 else
                     Scan->>Det: scan_text(msg.text, "slack://{channel_label}/{ts}")
                     Det-->>Scan: VecFinding
@@ -320,15 +327,17 @@ sequenceDiagram
 
 ## 5. Detector engine — `scan_text` + `Report::from_outcome`
 
-The detector engine is shared by all three sources. For every line
-under 4 KiB (pathological-regex guard), every detector's regex runs;
-matches that clear `min_length` and `min_entropy` (Shannon, bits per
+The detector engine is shared by all three sources. Every detector runs over
+each line; lines above 4 KiB are split into overlapping UTF-8-safe windows so
+regex work stays bounded without dropping coverage. Matches that clear
+`min_length` and `min_entropy` (Shannon, bits per
 byte) are first recorded as absolute byte spans. Bounded PEM matches
 expand through their matching footer. After the complete input has been
-scanned, overlapping and adjacent spans are merged and every safe `Finding`
-gets a ±2-line context window rendered from that complete redaction set.
-If the window includes an unscanned oversized line, or a PEM block is
-unterminated, context is omitted rather than rendered unsafely.
+scanned, overlapping and adjacent spans are merged. The default `scan_text`
+returns context-free safe findings. Explicit `scan_text_with_context` callers
+get a best-effort ±2-line window rendered from that complete redaction set;
+if the window includes an oversized line, or a PEM block is unterminated,
+context is omitted rather than rendered unsafely.
 The default path computes the fingerprint and redacted display value while the
 match is in scope, then drops matched plaintext before returning. `Report` then
 groups by that fingerprint (so the same key in 12 files becomes one entry with 12
@@ -350,11 +359,10 @@ sequenceDiagram
 
     Caller->>Scan: scan_text(text, location)
     loop every line (idx, line)
-        alt line.len > 4096
-            Scan->>Scan: skip — pathological backtracking guard
-        else
+        Scan->>Scan: make one window or overlapping 4 KiB UTF-8-safe windows
+        loop every window
             loop every detector
-                Scan->>Det: pattern.captures_iter(line)
+                Scan->>Det: pattern.captures_iter(window)
                 loop every captured match
                     Det-->>Scan: caps.get(1).or(caps.get(0))
                     alt min_length set AND raw.len < min_length
@@ -374,14 +382,14 @@ sequenceDiagram
     Scan->>Span: sort + merge overlapping or adjacent accepted spans
     Span-->>Scan: complete normalized redaction set
     loop every pending finding
-        alt bounded PEM and context window has no skipped oversized line
+        alt explicit context API and bounded PEM/window
             Scan->>Ctx: build_context(text, line_idx, merged spans)
             Ctx->>Ctx: redact every span intersecting lines[lo..hi]
             Ctx-->>Scan: 5-line redacted window
         else safe rendering cannot be proven
             Scan->>Scan: context = None
         end
-        Scan->>FP: sha256(raw span)[..8] + redact(raw span)
+        Scan->>FP: full sha256(raw span) + redact(raw span)
         FP-->>Scan: fingerprint + redacted display value
         Scan->>Scan: out.push Finding { detector, severity, location, line, fingerprint, redacted, context }
     end
@@ -421,11 +429,11 @@ flowchart TD
     Threshold -->|no| ArgErr[clap argument error]
     Threshold -->|yes| Sub{subcommand}
 
-    Sub -->|local path| L[standard gitignore-aware scan<br/>optional --secrets-mode ignored credential supplement<br/>canonical root, no symlinks or unsafe internals<br/>per-file size + binary + utf8 gates]
-    Sub -->|github owner or owner/repo| G[reject --unredacted before access<br/>GITHUB_TOKEN optional, 60 rph fallback<br/>orgs then users endpoint fallback<br/>rate-limit + 429 retry loop]
-    Sub -->|slack --days N| S[reject --unredacted before access<br/>SLACK_BOT_TOKEN required else bail<br/>cursored list_conversations + fetch_history<br/>skip archived + non-member]
+    Sub -->|local path| L[standard gitignore-aware scan<br/>optional --secrets-mode ignored credential supplement<br/>root-relative confined opens<br/>bounded reads + binary + utf8 exclusions]
+    Sub -->|github owner or owner/repo| G[reject --unredacted before access<br/>GITHUB_TOKEN optional, 60 rph fallback<br/>user fallback only after org 404<br/>same-origin bounded HTTP + retries]
+    Sub -->|slack --days N| S[reject --unredacted before access<br/>SLACK_BOT_TOKEN required else bail<br/>bounded cursored list + history<br/>exclude archived, non-member, external-shared]
 
-    L --> Det[scan_text per file<br/>line under 4 KiB<br/>collect every accepted byte span<br/>expand bounded PEM blocks<br/>merge overlap + adjacency<br/>render context from complete redaction set]
+    L --> Det[scan_text per object<br/>overlapping windows cover long lines<br/>collect every accepted byte span<br/>expand bounded PEM blocks<br/>merge overlap + adjacency<br/>default context omitted]
     G --> Det
     S --> Det
 
@@ -443,9 +451,9 @@ flowchart TD
     Sarif --> CoverageFail{coverage requires<br/>failure?}
     Json --> CoverageFail
     Human --> CoverageFail
-    CoverageFail -->|yes| E3[process::exit 3 — coverage failure]
+    CoverageFail -->|yes| E3[return exit 3 — coverage failure]
     CoverageFail -->|no| AnyHigh{any aggregate<br/>Critical or High?}
-    AnyHigh -->|yes| E2[process::exit 2 — CI-friendly]
+    AnyHigh -->|yes| E2[return exit 2 — CI-friendly]
     AnyHigh -->|no| E0[exit 0]
 
     Err1 --> End([process exits])
