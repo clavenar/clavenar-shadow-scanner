@@ -46,6 +46,13 @@ jobs:
           fi
           echo "version=$TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Expose preinstalled rustup without modifying shell profiles
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            [ -x "$HOME/.cargo/bin/rustup" ] || { echo "::error::rustup is not preinstalled"; exit 1; }
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.97.0
