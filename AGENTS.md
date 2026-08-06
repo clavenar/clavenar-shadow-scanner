@@ -37,7 +37,8 @@ Exit codes: `0` accepted coverage and no high/critical findings · `3` total sou
 - **Formatting is an owning-CI gate.** Run `cargo fmt --all -- --check`
   before pushing Rust changes; CI runs it before check, test, and clippy.
 
-- After adding or updating a feature, also update the relevant `MANUAL_TESTS*` file(s) when needed.
+- When a CLI source, output, redaction, or exit-code flow changes, update
+  `MANUAL_TESTS.md`.
 
 - **Redacted and context-free by default.** Secrets render `<first4>…<last4>`; JSON has no `raw` field and default scans omit neighboring source. `scan_text_with_context` is an explicit best-effort library opt-in. `--unredacted` shows plaintext, adds `raw`, and the human report leads with a `!! UNREDACTED OUTPUT` banner. SARIF is **always redacted** regardless of `--unredacted`.
 - **Secrets mode stays root-confined.** The ignored-credential supplement never follows symlinks, never enters VCS/dependency/build/cache internals, deduplicates the standard walk, and retains size/binary/UTF-8 guards.
@@ -53,4 +54,5 @@ Exit codes: `0` accepted coverage and no high/critical findings · `3` total sou
 - `deny.toml` is synced verbatim from `clavenar-specs` — edit it there first, then mirror the exact bytes.
 
 ## Pointers
-README.md · SECURITY.md · docs/SEQUENCES.md · docs/DETECTORS.md
+README.md · SECURITY.md · MANUAL_TESTS.md · docs/SEQUENCES.md ·
+docs/DETECTORS.md
