@@ -34,7 +34,7 @@ No account, no sign-up — grab the static binary and run.
 runtime deps, no installer):
 
 ```bash
-V=0.1.6
+V=1.0.0
 curl -fsSL "https://github.com/clavenar/clavenar-shadow-scanner/releases/download/v${V}/clavenar-shadow-scanner-${V}-x86_64-linux-musl.tar.gz" \
   | tar -xz
 ./clavenar-shadow-scanner local ~

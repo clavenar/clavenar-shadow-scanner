@@ -1,6 +1,6 @@
 name: release
 
-# Push a tag matching v* (e.g. v0.2.0) to publish. The tag must
+# Push a tag matching v* (e.g. v1.0.0) to publish. The tag must
 # match Cargo.toml's `version`; the workflow asserts this before
 # anything destructive runs.
 #
