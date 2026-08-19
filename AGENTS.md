@@ -27,10 +27,10 @@ Exit codes: `0` accepted coverage and no high/critical findings · `3` total sou
 ## Layout
 - `src/main.rs` — CLI entry. clap `Cli`/`Command` enum (`Local`/`Github`/`Slack`); `OutputArgs` flattened into each subcommand so all share one output surface.
 - `src/lib.rs` — public API: re-exports detector APIs plus `ScanOutcome`, `ScanCoverage`, `SourceError`, and `SourceErrorKind`. Library consumers (tests, future SDK) call these directly; `main.rs` is a thin wrapper.
-- `src/detector.rs` — 37 hand-written regex detectors + optional Shannon-entropy/length gates; overlapping windows cover long lines, `scan_text` is context-free by default, and `scan_text_with_context` is explicit opt-in.
+- `src/detector.rs` — hand-written regex detector catalog + optional Shannon-entropy/length gates; overlapping windows cover long lines, `scan_text` is context-free by default, and `scan_text_with_context` is explicit opt-in. Derive the live rule inventory from `build_detectors` rather than copying a count.
 - `src/sources/` — per-platform fetchers, each returning the common typed outcome with findings, scanned objects/bytes, intentional exclusions and declared scope, skips, structured errors, truncation, invariant partial state, and source-neutral coverage evaluation: `local.rs` (gitignore-aware walk plus root-confined `Secrets` supplement; Linux opens use `openat2` confinement), `github.rs` (owner/repo scan, recursive-tree truncation, same-origin bounded HTTP and rate-limit backoff), `slack.rs` (same-origin bounded HTTP and cursor-paginated workspace history; `DEFAULT_LOOKBACK_DAYS`).
 - `src/output/` — `mod.rs` (`Report`, coverage evaluation, redaction, `filter_by_min_severity`), `sarif.rs` (SARIF v2.1.0 emitter with coverage and decision properties).
-- `tests/` — integration tests. `docs/SEQUENCES.md` — sequence diagrams for the five primary paths + the request decision-tree. `docs/DETECTORS.md` — detector catalog (37 rules, gates, SARIF contract); keep in sync with `build_detectors`.
+- `tests/` — integration tests. `docs/SEQUENCES.md` — sequence diagrams for the five primary paths + the request decision-tree. `docs/DETECTORS.md` — detector catalog, gates, and SARIF contract; keep its rule inventory in sync with `build_detectors`.
 
 ## Conventions & invariants
 
