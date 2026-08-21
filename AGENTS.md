@@ -20,7 +20,8 @@ Host-build caveat: `CARGO_TARGET_DIR=/tmp/clavenar-shadow-scanner-target` (a rep
 Run: CLI binary `clavenar-shadow-scanner` — no listener, no daemon; it scans and exits. Subcommands:
 `local <path> [--secrets-mode]` · `github <owner>[/<repo>]` (scans the default branch of non-fork, non-archived repos;
 `--include-forks` / `--include-archived` widen) · `slack [--days N]`. Common flags on every subcommand:
-`--json` | `--sarif` (mutually exclusive) · `--unredacted` · `--severity-min critical|high|medium|low` · `--max-partial-percent 0..100` (default 10).
+`--json` | `--sarif` (mutually exclusive) · `--severity-min critical|high|medium|low` · `--max-partial-percent 0..100` (default 10).
+`--unredacted` is local-only (github/slack reject it) and cannot combine with `--sarif`.
 Auth via env: `GITHUB_TOKEN` (optional; public API caps at 60 req/hr), `SLACK_BOT_TOKEN` (`xoxb-…`). `local` needs no creds.
 Exit codes: `0` accepted coverage and no high/critical findings · `3` total source failure, truncation, or incomplete percentage strictly above the configured threshold · `2` ≥1 high/critical (CI-friendly) · `1` setup/fatal runtime error before a typed outcome. Coverage exit `3` takes precedence over finding exit `2`.
 
